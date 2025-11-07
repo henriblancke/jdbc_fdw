@@ -1217,6 +1217,7 @@ jdbc_append_group_by_clause(StringInfo buf,
 							 char *q_char)
 {
 	Query	   *query = root->parse;
+	jdbcFdwRelationInfo *fpinfo = (jdbcFdwRelationInfo *) foreignrel->fdw_private;
 	ListCell   *lc;
 	bool		first = true;
 	deparse_expr_cxt context;
@@ -1231,6 +1232,14 @@ jdbc_append_group_by_clause(StringInfo buf,
 
 	appendStringInfoString(buf, " GROUP BY ");
 
+	/* Set up context struct for recursion */
+	context.root = root;
+	context.foreignrel = foreignrel;
+	context.buf = buf;
+	context.params_list = NULL;
+	context.scanrel = IS_UPPER_REL(foreignrel) ? fpinfo->outerrel : foreignrel;
+	context.q_char = q_char;
+
 	/*
 	 * Walk through the groupClause and deparse each grouping column.
 	 * The groupClause contains SortGroupClause entries which reference
@@ -1244,15 +1253,6 @@ jdbc_append_group_by_clause(StringInfo buf,
 		if (!first)
 			appendStringInfoString(buf, ", ");
 		first = false;
-
-		/*
-		 * Set up deparse context and deparse the grouping expression.
-		 */
-		context.buf = buf;
-		context.root = root;
-		context.foreignrel = foreignrel;
-		context.params_list = NULL;
-		context.q_char = q_char;
 
 		jdbc_deparse_expr((Expr *) tle->expr, &context);
 	}
