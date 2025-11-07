@@ -1241,9 +1241,9 @@ jdbc_append_group_by_clause(StringInfo buf,
 	context.q_char = q_char;
 
 	/*
-	 * Walk through the groupClause and deparse each grouping column.
+	 * Deparse GROUP BY expressions.
 	 * The groupClause contains SortGroupClause entries which reference
-	 * targetlist entries by tleSortGroupRef.
+	 * the query's targetlist entries by tleSortGroupRef.
 	 */
 	foreach(lc, query->groupClause)
 	{
@@ -1254,6 +1254,12 @@ jdbc_append_group_by_clause(StringInfo buf,
 			appendStringInfoString(buf, ", ");
 		first = false;
 
+		/*
+		 * Deparse the grouping expression. The expression comes from the
+		 * original query's target list, and we've verified in
+		 * jdbc_foreign_grouping_ok() that these expressions are safe to
+		 * push down.
+		 */
 		jdbc_deparse_expr((Expr *) tle->expr, &context);
 	}
 }

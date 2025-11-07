@@ -2303,6 +2303,12 @@ jdbc_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel)
 	 */
 	fpinfo->relation_name = makeStringInfo();
 
+	/*
+	 * Store the target list we built for the grouped relation.
+	 * This will be used when deparsing the query.
+	 */
+	fpinfo->grouped_tlist = tlist;
+
 	return true;
 }
 
@@ -2392,8 +2398,10 @@ jdbc_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
 
-	/* Store the grouped target list for use during deparsing */
-	fpinfo->grouped_tlist = jdbc_build_tlist_to_deparse(grouped_rel);
+	/*
+	 * Note: fpinfo->grouped_tlist was already set in jdbc_foreign_grouping_ok()
+	 * with the correct target list for deparsing.
+	 */
 
 	/* Create and add foreign path to the grouping relation. */
 #if (PG_VERSION_NUM >= 120000)
