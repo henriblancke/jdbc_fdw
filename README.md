@@ -77,6 +77,23 @@ List of aggregate functions push-down:
 ```
 sum, avg, stddev, stddev_pop, stddev_samp, var_pop, var_samp, variance, max, min, count.
 ```
+
+#### GROUP BY clause push-down
+The jdbc_fdw supports pushing down GROUP BY clauses to the remote server.
+When combined with aggregate functions, both the aggregation and grouping
+are performed on the remote server, reducing data transfer and improving performance.
+
+Supported:
+- Single and multiple column grouping
+- Grouping by expressions
+- GROUP BY with WHERE clause
+- Standard SQL GROUP BY syntax
+
+Not supported:
+- GROUPING SETS
+- CUBE/ROLLUP
+- HAVING clause (planned for future release)
+
 ### Notes about features
 
 #### Maximum digits storing float value of MySQL
@@ -311,8 +328,8 @@ Import a JDBC schema:
 Limitations
 -----------
 #### Unsupported clause
-The following clasues are not support in jdbc_fdw:
-RETURNING, GROUPBY, ORDER BY clauses, casting type, transaction control
+The following clauses are not supported in jdbc_fdw:
+RETURNING, ORDER BY clauses, casting type, transaction control, GROUPING SETS, HAVING
 
 #### Array Type
 Currently, jdbc_fdw doesn't support array type.

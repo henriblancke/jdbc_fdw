@@ -2331,15 +2331,18 @@ jdbc_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	Cost		total_cost;
 
 	/*
-	 * Nothing to be done, if there is no aggregation required. JDBC does not
-	 * support GROUP BY, GROUPING SET, HAVING, so also return when there are
-	 * those clauses.
+	 * Nothing to be done, if there is no aggregation required.
+	 * We don't support GROUPING SETS or HAVING yet.
 	 */
-	if (parse->groupClause ||
-		parse->groupingSets ||
+	if (parse->groupingSets ||
 		root->hasHavingQual ||
 		!parse->hasAggs)
 		return;
+
+	/*
+	 * For GROUP BY queries, we need to ensure all grouping expressions
+	 * are safe to push down. This is checked in jdbc_foreign_grouping_ok().
+	 */
 
 #if (PG_VERSION_NUM >= 110000)
 	Assert(extra->patype == PARTITIONWISE_AGGREGATE_NONE ||
@@ -2388,6 +2391,9 @@ jdbc_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	fpinfo->width = width;
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
+
+	/* Store the grouped target list for use during deparsing */
+	fpinfo->grouped_tlist = jdbc_build_tlist_to_deparse(grouped_rel);
 
 	/* Create and add foreign path to the grouping relation. */
 #if (PG_VERSION_NUM >= 120000)

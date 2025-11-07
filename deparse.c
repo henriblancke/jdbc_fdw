@@ -969,6 +969,11 @@ jdbc_deparse_select_stmt_for_rel(StringInfo buf,
 		}
 	}
 
+	/* Add GROUP BY clause if present */
+	if (fpinfo->grouped_tlist != NIL)
+		jdbc_append_group_by_clause(buf, root, baserel,
+									fpinfo->grouped_tlist, q_char);
+
 	/* Add LIMIT clause if necessary */
 	if (has_limit)
 		jdbc_append_limit_clause(&context);
@@ -1194,6 +1199,63 @@ jdbc_append_where_clause(StringInfo buf,
 	}
 
 	jdbc_reset_transmission_modes(nestlevel);
+}
+
+/*
+ * jdbc_append_group_by_clause
+ *		Append GROUP BY clause to the query.
+ *
+ * Build up the GROUP BY clause from the grouping target list.
+ * GROUP BY expressions must match SELECT list expressions that have
+ * sortgroupref set.
+ */
+void
+jdbc_append_group_by_clause(StringInfo buf,
+							 PlannerInfo *root,
+							 RelOptInfo *foreignrel,
+							 List *tlist,
+							 char *q_char)
+{
+	Query	   *query = root->parse;
+	ListCell   *lc;
+	bool		first = true;
+	deparse_expr_cxt context;
+
+	/* GROUP BY is used only with UPPERREL_GROUP_AGG */
+	if (foreignrel->reloptkind != RELOPT_UPPER_REL)
+		return;
+
+	/* If no GROUP BY clause, nothing to do */
+	if (!query->groupClause)
+		return;
+
+	appendStringInfoString(buf, " GROUP BY ");
+
+	/*
+	 * Walk through the groupClause and deparse each grouping column.
+	 * The groupClause contains SortGroupClause entries which reference
+	 * targetlist entries by tleSortGroupRef.
+	 */
+	foreach(lc, query->groupClause)
+	{
+		SortGroupClause *grpcl = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(grpcl, query->targetList);
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		/*
+		 * Set up deparse context and deparse the grouping expression.
+		 */
+		context.buf = buf;
+		context.root = root;
+		context.foreignrel = foreignrel;
+		context.params_list = NULL;
+		context.q_char = q_char;
+
+		jdbc_deparse_expr((Expr *) tle->expr, &context);
+	}
 }
 
 /*

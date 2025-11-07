@@ -9,15 +9,28 @@ SHLIB_LINK = $(libpq)
 EXTENSION = jdbc_fdw
 DATA = jdbc_fdw--1.0.sql jdbc_fdw--1.0--1.1.sql jdbc_fdw--1.2.sql
 
-REGRESS = postgresql/new_test postgresql/aggregates postgresql/date postgresql/float8 postgresql/insert postgresql/select postgresql/update postgresql/delete postgresql/float4 postgresql/int4 postgresql/int8 postgresql/ported_postgres_fdw postgresql/exec_function 
+REGRESS = postgresql/new_test postgresql/aggregates postgresql/group_by postgresql/date postgresql/float8 postgresql/insert postgresql/select postgresql/update postgresql/delete postgresql/float4 postgresql/int4 postgresql/int8 postgresql/ported_postgres_fdw postgresql/exec_function 
 
 JDBC_CONFIG = jdbc_config
 
-LIBDIR=/usr/lib64/
+UNAME = $(shell uname)
+
+# Set JAVA_HOME and LIBDIR based on OS
+ifeq ($(UNAME),Darwin)
+	# macOS
+	JAVA_HOME := $(shell /usr/libexec/java_home 2>/dev/null || echo /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home)
+	LIBDIR = $(JAVA_HOME)/lib/server
+else
+	# Linux
+	LIBDIR = /usr/lib64/
+endif
 
 SHLIB_LINK += -L$(LIBDIR) -ljvm
 
-UNAME = $(shell uname)
+# Add rpath for macOS to find libjvm at runtime
+ifeq ($(UNAME),Darwin)
+	SHLIB_LINK += -Wl,-rpath,$(LIBDIR)
+endif
 
 JAVA_SOURCES = \
 	JDBCUtils.java \

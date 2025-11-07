@@ -1,0 +1,33 @@
+# Compiled Object files
+*.o
+*.so
+*.dylib
+*.dll
+
+# Java compiled classes
+*.class
+
+# Build artifacts
+jdbc_fdw.so
+jdbc_fdw.dylib
+
+# PostgreSQL regression test results
+regression.diffs
+regression.out
+results/
+tmp_check/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.log
