@@ -1237,29 +1237,32 @@ jdbc_append_group_by_clause(StringInfo buf,
 	context.foreignrel = foreignrel;
 	context.buf = buf;
 	context.params_list = NULL;
-	context.scanrel = IS_UPPER_REL(foreignrel) ? fpinfo->outerrel : foreignrel;
+	/*
+	 * For upper relations, we deparse against the outerrel (base scan).
+	 * This is because GROUP BY expressions contain Vars that reference
+	 * the base table columns.
+	 */
+	context.scanrel = fpinfo->outerrel;
 	context.q_char = q_char;
 
 	/*
-	 * Deparse GROUP BY expressions.
-	 * We look up expressions in the grouped_tlist (not query->targetList)
-	 * because the grouped_tlist has been adjusted to have Var references
-	 * that match the outerrel's output, which is what our deparse context
-	 * expects.
+	 * Deparse GROUP BY expressions by looking them up in the query's
+	 * original target list. We've already verified these expressions
+	 * are safe to push down in jdbc_foreign_grouping_ok().
 	 */
 	foreach(lc, query->groupClause)
 	{
 		SortGroupClause *grpcl = (SortGroupClause *) lfirst(lc);
-		TargetEntry *tle = get_sortgroupref_tle(grpcl->tleSortGroupRef, tlist);
+		TargetEntry *tle = get_sortgroupclause_tle(grpcl, query->targetList);
 
 		if (!first)
 			appendStringInfoString(buf, ", ");
 		first = false;
 
 		/*
-		 * Deparse the grouping expression. The expression comes from the
-		 * grouped_tlist which we built in jdbc_foreign_grouping_ok(),
-		 * with Var references adjusted for the outer relation context.
+		 * Deparse the expression. Since our context.scanrel is set to
+		 * the base relation (outerrel), the Var references in the
+		 * expression will be resolved correctly.
 		 */
 		jdbc_deparse_expr((Expr *) tle->expr, &context);
 	}
