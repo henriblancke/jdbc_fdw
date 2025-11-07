@@ -1242,13 +1242,15 @@ jdbc_append_group_by_clause(StringInfo buf,
 
 	/*
 	 * Deparse GROUP BY expressions.
-	 * The groupClause contains SortGroupClause entries which reference
-	 * the query's targetlist entries by tleSortGroupRef.
+	 * We look up expressions in the grouped_tlist (not query->targetList)
+	 * because the grouped_tlist has been adjusted to have Var references
+	 * that match the outerrel's output, which is what our deparse context
+	 * expects.
 	 */
 	foreach(lc, query->groupClause)
 	{
 		SortGroupClause *grpcl = (SortGroupClause *) lfirst(lc);
-		TargetEntry *tle = get_sortgroupclause_tle(grpcl, query->targetList);
+		TargetEntry *tle = get_sortgroupref_tle(grpcl->tleSortGroupRef, tlist);
 
 		if (!first)
 			appendStringInfoString(buf, ", ");
@@ -1256,9 +1258,8 @@ jdbc_append_group_by_clause(StringInfo buf,
 
 		/*
 		 * Deparse the grouping expression. The expression comes from the
-		 * original query's target list, and we've verified in
-		 * jdbc_foreign_grouping_ok() that these expressions are safe to
-		 * push down.
+		 * grouped_tlist which we built in jdbc_foreign_grouping_ok(),
+		 * with Var references adjusted for the outer relation context.
 		 */
 		jdbc_deparse_expr((Expr *) tle->expr, &context);
 	}
