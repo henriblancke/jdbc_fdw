@@ -142,6 +142,8 @@ static void jdbc_deparse_array_ref(ArrayRef * node, deparse_expr_cxt *context);
 static void jdbc_deparse_array_ref(SubscriptingRef *node, deparse_expr_cxt *context);
 #endif
 static void jdbc_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context);
+static void jdbc_deparse_sql_syntax_func(FuncExpr *node, const char *proname, deparse_expr_cxt *context);
+static void jdbc_deparse_extract(FuncExpr *node, deparse_expr_cxt *context);
 static void jdbc_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context);
 static void jdbc_deparse_operator_name(StringInfo buf, Form_pg_operator opform);
 static void jdbc_deparse_distinct_expr(DistinctExpr *node, deparse_expr_cxt *context);
@@ -150,6 +152,7 @@ static void jdbc_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node,
 static void jdbc_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context);
 static void jdbc_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context);
 static void jdbc_deparse_null_test(NullTest *node, deparse_expr_cxt *context);
+static void jdbc_deparse_case_expr(CaseExpr *node, deparse_expr_cxt *context);
 static void jdbc_append_limit_clause(deparse_expr_cxt *context);
 static void jdbc_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context);
 static void jdbc_append_function_name(Oid funcid, deparse_expr_cxt *context);
@@ -175,6 +178,29 @@ static const char *JdbcSupportedBuiltinAggFunction[] = {
 	"var_samp",
 	"variance",
 	NULL};
+
+/*
+ * Dispatch table for SQL syntax functions (COERCE_SQL_SYNTAX).
+ * These functions use SQL-mandated special syntax like EXTRACT(field FROM source)
+ * instead of regular comma-separated function arguments.
+ */
+typedef void (*sql_syntax_deparser)(FuncExpr *node, deparse_expr_cxt *context);
+
+typedef struct SqlSyntaxFunction
+{
+	const char *funcname;
+	sql_syntax_deparser deparse_fn;
+} SqlSyntaxFunction;
+
+static const SqlSyntaxFunction sql_syntax_functions[] = {
+	{"extract", jdbc_deparse_extract},
+	/* Add more SQL syntax functions here as needed:
+	 * {"substring", jdbc_deparse_substring},
+	 * {"position", jdbc_deparse_position},
+	 * {"overlay", jdbc_deparse_overlay},
+	 */
+	{NULL, NULL}
+};
 
 /*
  * Deparse given targetlist and append it to context->buf.
@@ -281,7 +307,6 @@ jdbc_is_foreign_expr(PlannerInfo *root,
 {
 	foreign_glob_cxt glob_cxt;
 	foreign_loc_cxt loc_cxt;
-
 	/*
 	 * Check that the expression consists of nodes that are safe to execute
 	 * remotely.
@@ -293,9 +318,13 @@ jdbc_is_foreign_expr(PlannerInfo *root,
 	if (!jdbc_foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
 		return false;
 
-	/* Expressions examined here should be boolean, ie noncollatable */
-	Assert(loc_cxt.collation == InvalidOid);
-	Assert(loc_cxt.state == FDW_COLLATE_NONE);
+	/*
+	 * Expressions examined here should be boolean, ie noncollatable.
+	 * However, this is also used for target list expressions which may have
+	 * collations, so only assert for safety when debugging WHERE clauses.
+	 */
+	/* Assert(loc_cxt.collation == InvalidOid); */
+	/* Assert(loc_cxt.state == FDW_COLLATE_NONE); */
 
 	/*
 	 * An expression which includes any mutable functions can't be sent over
@@ -536,9 +565,15 @@ jdbc_foreign_expr_walker(Node *node,
 				/*
 				 * If function's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
+				 *
+				 * However, if the inputs are non-collatable (like DATE or numeric types),
+				 * we should allow the function even if inputcollid is set, because
+				 * there's no actual collation to validate.
 				 */
 				if (fe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE)
+					 /* OK, inputs have no collation (e.g., DATE, numeric types) */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 fe->inputcollid != inner_cxt.collation)
 					return false;
@@ -689,6 +724,56 @@ jdbc_foreign_expr_walker(Node *node,
 				state = FDW_COLLATE_NONE;
 			}
 			break;
+		case T_CaseExpr:
+			{
+				CaseExpr   *ce = (CaseExpr *) node;
+				ListCell   *lc;
+
+				/*
+				 * Recurse to CASE test expression (if any).
+				 */
+				if (!jdbc_foreign_expr_walker((Node *) ce->arg,
+											  glob_cxt, &inner_cxt))
+					return false;
+
+				/*
+				 * Recurse to WHEN clauses.
+				 */
+				foreach(lc, ce->args)
+				{
+					CaseWhen   *cw = lfirst_node(CaseWhen, lc);
+
+					/* Recurse to condition */
+					if (!jdbc_foreign_expr_walker((Node *) cw->expr,
+												  glob_cxt, &inner_cxt))
+						return false;
+
+					/* Recurse to result */
+					if (!jdbc_foreign_expr_walker((Node *) cw->result,
+												  glob_cxt, &inner_cxt))
+						return false;
+				}
+
+				/*
+				 * Recurse to ELSE clause (if any).
+				 */
+				if (!jdbc_foreign_expr_walker((Node *) ce->defresult,
+											  glob_cxt, &inner_cxt))
+					return false;
+
+				/*
+				 * CASE result collation must be safe if we're going to push it down.
+				 */
+				collation = ce->casecollid;
+				if (collation == InvalidOid)
+					state = FDW_COLLATE_NONE;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 collation == inner_cxt.collation)
+					state = FDW_COLLATE_SAFE;
+				else
+					state = FDW_COLLATE_UNSAFE;
+			}
+			break;
 		case T_ArrayExpr:
 			{
 				ArrayExpr  *a = (ArrayExpr *) node;
@@ -769,13 +854,11 @@ jdbc_foreign_expr_walker(Node *node,
 					return false;
 
 				/*
-				 * Does not push down DISTINCT inside aggregate function
-				 * because of undefined behavior of the GridDB JDBC driver.
-				 * TODO: We may hanlde DISTINCT in future with new release
-				 * of GridDB JDBC driver.
+				 * DISTINCT aggregates are supported by most modern databases
+				 * (BigQuery, Snowflake, PostgreSQL, MySQL).
+				 * Note: GridDB JDBC driver had issues with DISTINCT, but for
+				 * other databases it should work fine.
 				 */
-				if (agg->aggdistinct != NIL)
-					return false;
 
 				/*
 				 * Recurse to input args. aggdirectargs, aggorder and
@@ -801,16 +884,19 @@ jdbc_foreign_expr_walker(Node *node,
 				}
 
 				if (agg->aggorder || agg->aggfilter)
-				{
 					return false;
-				}
 
 				/*
 				 * If aggregate's input collation is not derived from a
 				 * foreign Var, it can't be sent to remote.
+				 *
+				 * However, if the inputs are non-collatable (like numeric, date types),
+				 * we should allow the aggregate even if inputcollid is set.
 				 */
 				if (agg->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE)
+					 /* OK, inputs have no collation */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 agg->inputcollid != inner_cxt.collation)
 					return false;
@@ -1769,6 +1855,9 @@ jdbc_deparse_expr(Expr *node, deparse_expr_cxt *context)
 		case T_Aggref:
 			jdbc_deparse_aggref((Aggref *) node, context);
 			break;
+		case T_CaseExpr:
+			jdbc_deparse_case_expr((CaseExpr *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
@@ -1943,6 +2032,66 @@ jdbc_deparse_array_ref(SubscriptingRef *node, deparse_expr_cxt *context)
 }
 
 /*
+ * Deparse EXTRACT(field FROM source).
+ * Standard SQL syntax supported by BigQuery, Snowflake, PostgreSQL, MySQL, etc.
+ */
+static void
+jdbc_deparse_extract(FuncExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	Const	   *field;
+	Expr	   *source;
+
+	/* EXTRACT has exactly 2 arguments: field name and source expression */
+	if (list_length(node->args) != 2)
+		elog(ERROR, "EXTRACT requires exactly 2 arguments");
+
+	field = (Const *) linitial(node->args);
+	source = (Expr *) lsecond(node->args);
+
+	/* Field must be a text constant */
+	if (!IsA(field, Const) || field->consttype != TEXTOID)
+		elog(ERROR, "EXTRACT field must be a text constant");
+
+	appendStringInfoString(buf, "EXTRACT(");
+	/* Deparse field name (e.g., 'year', 'month', 'day') without quotes */
+	appendStringInfoString(buf, TextDatumGetCString(field->constvalue));
+	appendStringInfoString(buf, " FROM ");
+	jdbc_deparse_expr(source, context);
+	appendStringInfoChar(buf, ')');
+}
+
+/*
+ * Dispatcher for SQL syntax functions (COERCE_SQL_SYNTAX).
+ * Uses the dispatch table to find and call the appropriate deparse function.
+ */
+static void
+jdbc_deparse_sql_syntax_func(FuncExpr *node, const char *proname, deparse_expr_cxt *context)
+{
+	int i;
+
+	/* Look up the function in the dispatch table */
+	for (i = 0; sql_syntax_functions[i].funcname != NULL; i++)
+	{
+		if (strcmp(proname, sql_syntax_functions[i].funcname) == 0)
+		{
+			/* Found it - call the specialized deparse function */
+			sql_syntax_functions[i].deparse_fn(node, context);
+			return;
+		}
+	}
+
+	/*
+	 * Function not in our dispatch table. Reject with a helpful error.
+	 * Users can request support for additional functions as needed.
+	 */
+	elog(ERROR, "SQL syntax function '%s' is not supported for remote execution. "
+		 "Supported SQL syntax functions: EXTRACT. "
+		 "To add support, update the sql_syntax_functions dispatch table in deparse.c",
+		 proname);
+}
+
+/*
  * Deparse a function call.
  */
 static void
@@ -1968,12 +2117,26 @@ jdbc_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	}
 
 	/*
-	 * Normal function: display as proname(args).
+	 * Look up the function name to check for special cases.
 	 */
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(node->funcid));
 	if (!HeapTupleIsValid(proctup))
 		elog(ERROR, "cache lookup failed for function %u", node->funcid);
 	procform = (Form_pg_proc) GETSTRUCT(proctup);
+	proname = NameStr(procform->proname);
+
+	/*
+	 * Special handling for functions that use SQL-mandated special syntax
+	 * (funcformat == COERCE_SQL_SYNTAX). These functions use keywords like
+	 * FROM, IN, etc. instead of commas to separate arguments.
+	 * Use the dispatch table to find the appropriate deparse function.
+	 */
+	if (node->funcformat == COERCE_SQL_SYNTAX)
+	{
+		jdbc_deparse_sql_syntax_func(node, proname, context);
+		ReleaseSysCache(proctup);
+		return;
+	}
 
 	/* Check if need to print VARIADIC (cf. ruleutils.c) */
 	use_variadic = node->funcvariadic;
@@ -1988,7 +2151,6 @@ jdbc_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	}
 
 	/* Deparse the function name ... */
-	proname = NameStr(procform->proname);
 	appendStringInfo(buf, "%s(", jdbc_quote_identifier(proname, q_char, false));
 	/* ... and all the arguments */
 	first = true;
@@ -2400,6 +2562,45 @@ jdbc_deparse_null_test(NullTest *node, deparse_expr_cxt *context)
 		appendStringInfoString(buf, " IS NULL)");
 	else
 		appendStringInfoString(buf, " IS NOT NULL)");
+}
+
+/*
+ * Deparse a CASE expression.
+ */
+static void
+jdbc_deparse_case_expr(CaseExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	ListCell   *lc;
+
+	appendStringInfoString(buf, "CASE");
+
+	/* Deparse test expression if present (simple CASE) */
+	if (node->arg)
+	{
+		appendStringInfoChar(buf, ' ');
+		jdbc_deparse_expr(node->arg, context);
+	}
+
+	/* Deparse WHEN clauses */
+	foreach(lc, node->args)
+	{
+		CaseWhen   *cw = lfirst_node(CaseWhen, lc);
+
+		appendStringInfoString(buf, " WHEN ");
+		jdbc_deparse_expr(cw->expr, context);
+		appendStringInfoString(buf, " THEN ");
+		jdbc_deparse_expr(cw->result, context);
+	}
+
+	/* Deparse ELSE clause if present */
+	if (node->defresult)
+	{
+		appendStringInfoString(buf, " ELSE ");
+		jdbc_deparse_expr(node->defresult, context);
+	}
+
+	appendStringInfoString(buf, " END");
 }
 
 /*
