@@ -3171,6 +3171,21 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		{
 			JtableInfo *tmpTableInfo = (JtableInfo *) lfirst(table_lc);
 
+			/* Emit type conversion warnings if any */
+			char	  **warnings = jq_get_type_warnings(jdbcUtilsInfo, tmpTableInfo->table_name);
+
+			if (warnings != NULL)
+			{
+				int			i;
+
+				for (i = 0; warnings[i] != NULL; i++)
+				{
+					ereport(WARNING,
+							(errmsg("Type conversion for table '%s': %s",
+									tmpTableInfo->table_name, warnings[i])));
+				}
+			}
+
 			resetStringInfo(&buf);
 			if (recreate)
 			{

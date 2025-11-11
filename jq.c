@@ -1819,6 +1819,87 @@ jq_get_schema_info(JDBCUtilsInfo * jdbcUtilsInfo)
 }
 
 /*
+ * jq_get_type_warnings
+ *      Returns type conversion warnings for a given table
+ */
+char **
+jq_get_type_warnings(JDBCUtilsInfo * jdbcUtilsInfo, char *tableName)
+{
+	jobject		JDBCUtilsObject;
+	jclass		JDBCUtilsClass;
+	jstring		jtableName;
+	jmethodID	idGetTypeConversionWarnings;
+	jobjectArray jwarnings;
+	char	  **warnings = NULL;
+	int			warning_count;
+	int			i;
+
+	if (tableName == NULL)
+		return NULL;
+
+	jtableName = (*Jenv)->NewStringUTF(Jenv, tableName);
+
+	/* Get JDBCUtils */
+	PG_TRY();
+	{
+		jq_get_JDBCUtils(jdbcUtilsInfo, &JDBCUtilsClass, &JDBCUtilsObject);
+	}
+	PG_CATCH();
+	{
+		(*Jenv)->DeleteLocalRef(Jenv, jtableName);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/* Get getTypeConversionWarnings method */
+	idGetTypeConversionWarnings = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass,
+													   "getTypeConversionWarnings",
+													   "(Ljava/lang/String;)[Ljava/lang/String;");
+	if (idGetTypeConversionWarnings == NULL)
+	{
+		(*Jenv)->DeleteLocalRef(Jenv, jtableName);
+		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getTypeConversionWarnings method")));
+	}
+
+	/* Call Java method */
+	jq_exception_clear();
+	jwarnings = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject,
+										  idGetTypeConversionWarnings, jtableName);
+	jq_get_exception();
+
+	(*Jenv)->DeleteLocalRef(Jenv, jtableName);
+
+	if (jwarnings == NULL)
+		return NULL;
+
+	/* Convert Java String array to C string array */
+	warning_count = (*Jenv)->GetArrayLength(Jenv, jwarnings);
+
+	if (warning_count == 0)
+	{
+		(*Jenv)->DeleteLocalRef(Jenv, jwarnings);
+		return NULL;
+	}
+
+	/* Allocate array with NULL terminator */
+	warnings = (char **) palloc0(sizeof(char *) * (warning_count + 1));
+
+	for (i = 0; i < warning_count; i++)
+	{
+		jobject		jwarning = (*Jenv)->GetObjectArrayElement(Jenv, jwarnings, i);
+		char	   *warning_str = jdbc_convert_string_to_cstring(jwarning);
+
+		warnings[i] = pstrdup(warning_str);
+	}
+
+	warnings[warning_count] = NULL;	/* NULL terminator */
+
+	(*Jenv)->DeleteLocalRef(Jenv, jwarnings);
+
+	return warnings;
+}
+
+/*
  * jq_get_JDBCUtils: get JDBCUtilsClass and JDBCUtilsObject
  */
 static void

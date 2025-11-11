@@ -210,6 +210,8 @@ init_jdbcfdw_options(void)
 		{"key", AttributeRelationId, false},
 		{"column_name", AttributeRelationId, false},
 		{"use_remote_estimate", ForeignTableRelationId, false},
+		/* type conversion options */
+		{"type_mappings", ForeignServerRelationId, false},
 		{NULL, InvalidOid, false}
 	};
 

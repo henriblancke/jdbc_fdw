@@ -33,6 +33,7 @@ public class JDBCUtils {
   private static int resultSetKey = 1;
   private static ConcurrentHashMap<Integer, resultSetInfo> resultSetInfoMap =
       new ConcurrentHashMap<Integer, resultSetInfo>();
+  private Map<String, List<String>> typeConversionWarnings = new HashMap<String, List<String>>();
 
   /*
    * createConnection
@@ -439,76 +440,362 @@ public class JDBCUtils {
   }
 
   /*
+   * getDatabaseProduct
+   *      Returns the database product name in lowercase
+   */
+  private String getDatabaseProduct() throws SQLException {
+    checkConnExist();
+    String product = conn.getConnection().getMetaData().getDatabaseProductName();
+    return product.toLowerCase();
+  }
+
+  /*
    * getColumnTypes
    *      Returns the column name
    */
   public String[] getColumnTypes(String tableName) throws SQLException {
     try {
-      checkConnExist();
-      DatabaseMetaData md = conn.getConnection().getMetaData();
-      ResultSet tmpResultSet = md.getColumns(null, null, tableName, null);
-      List<String> tmpColumnTypesList = new ArrayList<String>();
-      while (tmpResultSet.next()) {
-        tmpColumnTypesList.add(tmpResultSet.getString("TYPE_NAME"));
+      String databaseProduct = getDatabaseProduct();
+
+      // Route to database-specific type mapper
+      if (databaseProduct.contains("bigquery") || databaseProduct.contains("google bigquery")) {
+        return getBigQueryColumnTypes(tableName);
+      } else if (databaseProduct.contains("snowflake")) {
+        return getSnowflakeColumnTypes(tableName);
+      } else {
+        // Default/generic mapper (original implementation for GridDB, etc.)
+        return getGenericColumnTypes(tableName);
       }
-      String[] tmpColumnTypes = new String[tmpColumnTypesList.size()];
-      for (int i = 0; i < tmpColumnTypesList.size(); i++) {
-        switch (tmpColumnTypesList.get(i)) {
-          case "BYTE":
-          case "SHORT":
-            tmpColumnTypes[i] = "SMALLINT";
-            break;
-          case "LONG":
-            tmpColumnTypes[i] = "BIGINT";
-            break;
-          case "CHAR":
-            tmpColumnTypes[i] = "CHAR (1)";
-            break;
-          case "STRING":
-            tmpColumnTypes[i] = "TEXT";
-            break;
-          case "FLOAT":
-            tmpColumnTypes[i] = "FLOAT4";
-            break;
-          case "DOUBLE":
-            tmpColumnTypes[i] = "FLOAT8";
-            break;
-          case "BLOB":
-            tmpColumnTypes[i] = "BYTEA";
-            break;
-          case "BOOL_ARRAY":
-            tmpColumnTypes[i] = "BOOL[]";
-            break;
-          case "STRING_ARRAY":
-            tmpColumnTypes[i] = "TEXT[]";
-            break;
-          case "BYTE_ARRAY":
-          case "SHORT_ARRAY":
-            tmpColumnTypes[i] = "SMALLINT[]";
-            break;
-          case "INTEGER_ARRAY":
-            tmpColumnTypes[i] = "INTEGER[]";
-            break;
-          case "LONG_ARRAY":
-            tmpColumnTypes[i] = "BIGINT[]";
-            break;
-          case "FLOAT_ARRAY":
-            tmpColumnTypes[i] = "FLOAT4[]";
-            break;
-          case "DOUBLE_ARRAY":
-            tmpColumnTypes[i] = "FLOAT8[]";
-            break;
-          case "TIMESTAMP_ARRAY":
-            tmpColumnTypes[i] = "TIMESTAMP[]";
-            break;
-          default:
-            tmpColumnTypes[i] = tmpColumnTypesList.get(i);
-        }
-      }
-      return tmpColumnTypes;
     } catch (Throwable e) {
       throw e;
     }
+  }
+
+  /*
+   * getGenericColumnTypes
+   *      Returns PostgreSQL column types for generic JDBC databases (GridDB, etc.)
+   */
+  private String[] getGenericColumnTypes(String tableName) throws SQLException {
+    checkConnExist();
+    DatabaseMetaData md = conn.getConnection().getMetaData();
+    ResultSet tmpResultSet = md.getColumns(null, null, tableName, null);
+    List<String> tmpColumnTypesList = new ArrayList<String>();
+    while (tmpResultSet.next()) {
+      tmpColumnTypesList.add(tmpResultSet.getString("TYPE_NAME"));
+    }
+    String[] tmpColumnTypes = new String[tmpColumnTypesList.size()];
+    for (int i = 0; i < tmpColumnTypesList.size(); i++) {
+      switch (tmpColumnTypesList.get(i)) {
+        case "BYTE":
+        case "SHORT":
+          tmpColumnTypes[i] = "SMALLINT";
+          break;
+        case "LONG":
+          tmpColumnTypes[i] = "BIGINT";
+          break;
+        case "CHAR":
+          tmpColumnTypes[i] = "CHAR (1)";
+          break;
+        case "STRING":
+          tmpColumnTypes[i] = "TEXT";
+          break;
+        case "FLOAT":
+          tmpColumnTypes[i] = "FLOAT4";
+          break;
+        case "DOUBLE":
+          tmpColumnTypes[i] = "FLOAT8";
+          break;
+        case "BLOB":
+          tmpColumnTypes[i] = "BYTEA";
+          break;
+        case "BOOL_ARRAY":
+          tmpColumnTypes[i] = "BOOL[]";
+          break;
+        case "STRING_ARRAY":
+          tmpColumnTypes[i] = "TEXT[]";
+          break;
+        case "BYTE_ARRAY":
+        case "SHORT_ARRAY":
+          tmpColumnTypes[i] = "SMALLINT[]";
+          break;
+        case "INTEGER_ARRAY":
+          tmpColumnTypes[i] = "INTEGER[]";
+          break;
+        case "LONG_ARRAY":
+          tmpColumnTypes[i] = "BIGINT[]";
+          break;
+        case "FLOAT_ARRAY":
+          tmpColumnTypes[i] = "FLOAT4[]";
+          break;
+        case "DOUBLE_ARRAY":
+          tmpColumnTypes[i] = "FLOAT8[]";
+          break;
+        case "TIMESTAMP_ARRAY":
+          tmpColumnTypes[i] = "TIMESTAMP[]";
+          break;
+        default:
+          tmpColumnTypes[i] = tmpColumnTypesList.get(i);
+      }
+    }
+    return tmpColumnTypes;
+  }
+
+  /*
+   * getBigQueryColumnTypes
+   *      Returns PostgreSQL column types for BigQuery database with intelligent fallbacks
+   */
+  private String[] getBigQueryColumnTypes(String tableName) throws SQLException {
+    checkConnExist();
+    DatabaseMetaData md = conn.getConnection().getMetaData();
+    ResultSet rs = md.getColumns(null, null, tableName, null);
+    List<String> types = new ArrayList<String>();
+    List<String> warnings = new ArrayList<String>();
+
+    while (rs.next()) {
+      String typeName = rs.getString("TYPE_NAME");
+      String columnName = rs.getString("COLUMN_NAME");
+      String pgType;
+
+      if (typeName == null) {
+        typeName = "";
+      }
+
+      switch (typeName.toUpperCase()) {
+        case "INT64":
+        case "INTEGER":
+          pgType = "BIGINT";
+          break;
+        case "FLOAT64":
+        case "FLOAT":
+          pgType = "FLOAT8";
+          break;
+        case "NUMERIC":
+          pgType = "NUMERIC";
+          break;
+        case "BIGNUMERIC":
+          pgType = "NUMERIC";
+          warnings.add("Column '" + columnName + "': BIGNUMERIC may lose precision in NUMERIC");
+          break;
+        case "STRING":
+          pgType = "TEXT";
+          break;
+        case "BYTES":
+          pgType = "BYTEA";
+          break;
+        case "BOOL":
+        case "BOOLEAN":
+          pgType = "BOOLEAN";
+          break;
+        case "DATE":
+          pgType = "DATE";
+          break;
+        case "TIME":
+          pgType = "TIME";
+          break;
+        case "DATETIME":
+          pgType = "TIMESTAMP";
+          break;
+        case "TIMESTAMP":
+          pgType = "TIMESTAMPTZ";
+          break;
+        case "JSON":
+          pgType = "JSONB";
+          break;
+        case "GEOGRAPHY":
+          pgType = "TEXT";
+          warnings.add("Column '" + columnName + "': GEOGRAPHY mapped to TEXT (WKT format)");
+          break;
+        case "INTERVAL":
+          pgType = "INTERVAL";
+          warnings.add("Column '" + columnName + "': INTERVAL semantics may differ");
+          break;
+        default:
+          // Handle complex types: STRUCT, ARRAY
+          if (typeName.toUpperCase().startsWith("STRUCT")) {
+            pgType = "JSONB";
+            warnings.add("Column '" + columnName + "': STRUCT mapped to JSONB (structure flattened)");
+          } else if (typeName.toUpperCase().startsWith("ARRAY")) {
+            pgType = handleBigQueryArray(typeName, columnName, warnings);
+          } else {
+            pgType = "TEXT";
+            warnings.add("Column '" + columnName + "': Unknown type '" + typeName + "' mapped to TEXT");
+          }
+      }
+
+      types.add(pgType);
+    }
+
+    // Store warnings for later retrieval
+    if (!warnings.isEmpty()) {
+      typeConversionWarnings.put(tableName, warnings);
+    }
+
+    return types.toArray(new String[0]);
+  }
+
+  /*
+   * handleBigQueryArray
+   *      Handles BigQuery ARRAY types, converting simple arrays to PostgreSQL arrays
+   *      and complex arrays (ARRAY<STRUCT>) to JSONB
+   */
+  private String handleBigQueryArray(String typeName, String columnName, List<String> warnings) {
+    // Check if complex array (contains STRUCT)
+    if (typeName.toUpperCase().contains("STRUCT")) {
+      warnings.add("Column '" + columnName + "': ARRAY<STRUCT> mapped to JSONB");
+      return "JSONB";
+    }
+
+    // Parse ARRAY<TYPE> to TYPE[]
+    if (typeName.startsWith("ARRAY<") && typeName.endsWith(">")) {
+      String elementType = typeName.substring(6, typeName.length() - 1).toUpperCase();
+      switch (elementType) {
+        case "INT64":
+        case "INTEGER":
+          return "BIGINT[]";
+        case "FLOAT64":
+        case "FLOAT":
+          return "FLOAT8[]";
+        case "STRING":
+          return "TEXT[]";
+        case "BOOL":
+        case "BOOLEAN":
+          return "BOOLEAN[]";
+        case "TIMESTAMP":
+          return "TIMESTAMPTZ[]";
+        case "DATE":
+          return "DATE[]";
+        case "NUMERIC":
+          return "NUMERIC[]";
+        default:
+          warnings.add("Column '" + columnName + "': Complex ARRAY type mapped to JSONB");
+          return "JSONB";
+      }
+    }
+
+    // Fallback for unrecognized array format
+    warnings.add("Column '" + columnName + "': ARRAY type mapped to JSONB");
+    return "JSONB";
+  }
+
+  /*
+   * getSnowflakeColumnTypes
+   *      Returns PostgreSQL column types for Snowflake database with intelligent fallbacks
+   */
+  private String[] getSnowflakeColumnTypes(String tableName) throws SQLException {
+    checkConnExist();
+    DatabaseMetaData md = conn.getConnection().getMetaData();
+    ResultSet rs = md.getColumns(null, null, tableName, null);
+    List<String> types = new ArrayList<String>();
+    List<String> warnings = new ArrayList<String>();
+
+    while (rs.next()) {
+      String typeName = rs.getString("TYPE_NAME");
+      String columnName = rs.getString("COLUMN_NAME");
+      int precision = rs.getInt("COLUMN_SIZE");
+      int scale = rs.getInt("DECIMAL_DIGITS");
+      String pgType;
+
+      if (typeName == null) {
+        typeName = "";
+      }
+
+      switch (typeName.toUpperCase()) {
+        case "NUMBER":
+          if (scale == 0) {
+            // Integer types - map based on precision
+            if (precision <= 4) {
+              pgType = "SMALLINT";
+            } else if (precision <= 9) {
+              pgType = "INTEGER";
+            } else {
+              pgType = "BIGINT";
+            }
+          } else {
+            // Decimal types
+            pgType = String.format("NUMERIC(%d,%d)", precision, scale);
+          }
+          break;
+        case "FLOAT":
+        case "FLOAT4":
+        case "FLOAT8":
+        case "DOUBLE":
+        case "DOUBLE PRECISION":
+        case "REAL":
+          pgType = "FLOAT8";
+          break;
+        case "VARCHAR":
+        case "STRING":
+        case "TEXT":
+        case "CHAR":
+        case "CHARACTER":
+          pgType = "TEXT";
+          break;
+        case "BINARY":
+        case "VARBINARY":
+          pgType = "BYTEA";
+          break;
+        case "BOOLEAN":
+          pgType = "BOOLEAN";
+          break;
+        case "DATE":
+          pgType = "DATE";
+          break;
+        case "TIME":
+          pgType = "TIME";
+          break;
+        case "DATETIME":
+        case "TIMESTAMP":
+        case "TIMESTAMP_NTZ":
+          pgType = "TIMESTAMP";
+          break;
+        case "TIMESTAMP_LTZ":
+        case "TIMESTAMP_TZ":
+          pgType = "TIMESTAMPTZ";
+          break;
+        case "VARIANT":
+          pgType = "JSONB";
+          warnings.add("Column '" + columnName + "': VARIANT mapped to JSONB");
+          break;
+        case "OBJECT":
+          pgType = "JSONB";
+          warnings.add("Column '" + columnName + "': OBJECT mapped to JSONB");
+          break;
+        case "ARRAY":
+          pgType = "JSONB";
+          warnings.add("Column '" + columnName + "': Semi-structured ARRAY mapped to JSONB");
+          break;
+        case "MAP":
+          pgType = "JSONB";
+          warnings.add("Column '" + columnName + "': MAP mapped to JSONB");
+          break;
+        case "GEOGRAPHY":
+        case "GEOMETRY":
+          pgType = "TEXT";
+          warnings.add("Column '" + columnName + "': " + typeName + " mapped to TEXT (WKT/GeoJSON format)");
+          break;
+        case "VECTOR":
+          pgType = "JSONB";
+          warnings.add("Column '" + columnName + "': VECTOR mapped to JSONB (consider pgvector extension)");
+          break;
+        case "FILE":
+        case "UNSTRUCTURED":
+          pgType = "TEXT";
+          warnings.add("Column '" + columnName + "': " + typeName + " mapped to TEXT (file reference)");
+          break;
+        default:
+          pgType = "TEXT";
+          warnings.add("Column '" + columnName + "': Unknown type '" + typeName + "' mapped to TEXT");
+      }
+
+      types.add(pgType);
+    }
+
+    // Store warnings for later retrieval
+    if (!warnings.isEmpty()) {
+      typeConversionWarnings.put(tableName, warnings);
+    }
+
+    return types.toArray(new String[0]);
   }
 
   /*
@@ -886,5 +1173,17 @@ public class JDBCUtils {
   /* finalize cached result set */
   public static void finalizeAllResultSet() {
     resultSetInfoMap.clear();
+  }
+
+  /*
+   * getTypeConversionWarnings
+   *      Returns the type conversion warnings for a given table
+   */
+  public String[] getTypeConversionWarnings(String tableName) {
+    List<String> warnings = typeConversionWarnings.get(tableName);
+    if (warnings == null || warnings.isEmpty()) {
+      return new String[0];
+    }
+    return warnings.toArray(new String[0]);
   }
 }
