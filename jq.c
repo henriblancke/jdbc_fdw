@@ -473,6 +473,13 @@ jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user
 		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getIdentifierQuoteString method")));
 	}
 
+	/* Get the default constructor */
+	jmethodID constructor = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "<init>", "()V");
+	if (constructor == NULL)
+	{
+		ereport(ERROR, (errmsg("Failed to find the JDBCUtils default constructor")));
+	}
+
 	/*
 	 * Construct the array to pass our parameters Query timeout is an int, we
 	 * need a string
@@ -501,7 +508,7 @@ jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user
 	{
 		(*Jenv)->SetObjectArrayElement(Jenv, argArray, i, stringArray[i]);
 	}
-	jdbcUtilsInfo->JDBCUtilsObject = (*Jenv)->AllocObject(Jenv, JDBCUtilsClass);
+	jdbcUtilsInfo->JDBCUtilsObject = (*Jenv)->NewObject(Jenv, JDBCUtilsClass, constructor);
 	if (jdbcUtilsInfo->JDBCUtilsObject == NULL)
 	{
 		/* Return Java memory */
@@ -1480,8 +1487,7 @@ jq_get_exception()
 		exceptionMsg = (jstring) (*Jenv)->CallObjectMethod(Jenv, exc, exceptionMsgID);
 		exceptionString = jdbc_convert_string_to_cstring((jobject) exceptionMsg);
 		err_msg = pstrdup(exceptionString);
-		ereport(DEBUG3, (errmsg("%s", err_msg)));
-		ereport(ERROR, (errmsg("remote server returned an error")));
+		ereport(ERROR, (errmsg("remote server returned an error: %s", err_msg)));
 	}
 	return;
 }
