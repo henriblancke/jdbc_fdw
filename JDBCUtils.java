@@ -427,15 +427,19 @@ public class JDBCUtils {
       }
       System.err.println("DEBUG requestedTables (uppercased): " + requestedTables);
 
-      // Use NULL schema pattern and filter on Java side for case-insensitive schema matching
-      // This works across all databases (Snowflake uppercase, BigQuery case-sensitive, etc.)
+      /*
+       * Optimization: If schema is specified, pass it to getTables to reduce result set.
+       * Otherwise fetch all schemas and filter on Java side for case-insensitive matching.
+       */
       ResultSet tmpResultSet;
       if (tablePattern != null) {
         // No specific tables - use pattern matching
-        tmpResultSet = md.getTables(null, null, tablePattern, null);
+        // If schema specified, use it; otherwise fetch from all schemas
+        tmpResultSet = md.getTables(null, schemaPattern, tablePattern, null);
       } else {
-        // Specific tables requested - fetch all tables from all schemas and filter
-        tmpResultSet = md.getTables(null, null, "%", null);
+        // Specific tables requested - fetch from specified schema or all schemas
+        // Use schemaPattern to limit scope (reduces rows for Snowflake performance)
+        tmpResultSet = md.getTables(null, schemaPattern, "%", null);
       }
 
       List<String> tmpTableNamesList = new ArrayList<String>();
