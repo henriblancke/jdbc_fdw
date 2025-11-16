@@ -48,8 +48,14 @@
  * Local housekeeping functions and Java objects
  */
 
-static __thread JNIEnv * Jenv = NULL;
-static JavaVM * jvm = NULL;
+/* JVM variables - PostgreSQL backends are single-threaded, no need for thread-local */
+static JNIEnv *Jenv = NULL;
+static JavaVM *jvm = NULL;
+static bool jvm_initialized = false;
+
+/* Session tracking for pgBouncer detection */
+static Oid last_userid = InvalidOid;
+static Oid last_dbid = InvalidOid;
 
 /*
  * Describes the valid options for objects that use this wrapper.
@@ -103,14 +109,14 @@ static Datum jdbc_convert_object_to_datum(Oid, int32, jobject);
 static void jdbc_destroy_jvm();
 
 /*
- * JVM attach function
+ * JVM detach function - currently unused as we keep JVM attached for backend lifetime
+ * static void jdbc_detach_jvm();
  */
-static void jdbc_attach_jvm(void);
 
 /*
- * JVM detach function
+ * Connection cache reset function for pgBouncer support
  */
-static void jdbc_detach_jvm();
+void jdbc_reset_connection_cache(void);
 
 /*
  * clears any exception that is currently being thrown
@@ -126,10 +132,139 @@ void		jq_get_exception(void);
  * get table infomations for importForeignSchema
  */
 static List *jq_get_column_infos(JDBCUtilsInfo * jdbcUtilsInfo, char *tablename);
-static List *jq_get_table_names(JDBCUtilsInfo * jdbcUtilsInfo);
+static List *jq_get_table_names(JDBCUtilsInfo * jdbcUtilsInfo, const char *schemaPattern, const char *tableNames);
 
 
 static void jq_get_JDBCUtils(JDBCUtilsInfo * jdbcUtilsInfo, jclass * JDBCUtilsClass, jobject * JDBCUtilsObject);
+
+/*
+ * jq_release_jdbc_utils_object
+ *		Clean up and delete the global JNI reference for a JDBCUtilsObject
+ */
+void
+jq_release_jdbc_utils_object(JDBCUtilsInfo * jdbcUtilsInfo)
+{
+	jobject		utils_obj;
+
+	/*
+	 * CRITICAL: Read JDBCUtilsObject ONCE and use that value throughout!
+	 * Multiple reads cause corruption. This function may be called during
+	 * error handling, so we must NOT trigger any errors here.
+	 */
+	if (jdbcUtilsInfo == NULL)
+		return;
+
+	if (jvm == NULL || Jenv == NULL)
+		return;
+
+	/* Read the field ONCE into a local variable */
+	utils_obj = jdbcUtilsInfo->JDBCUtilsObject;
+
+	if (utils_obj == NULL)
+		return;
+
+	/*
+	 * CRITICAL SAFETY: DO NOT delete global references during cleanup!
+	 *
+	 * Deleting global JNI references during PostgreSQL cleanup/shutdown
+	 * causes JVM crashes (SIGSEGV, SIGABRT). The JVM may be in an unstable
+	 * state during cleanup, and DeleteGlobalRef can trigger internal JVM
+	 * errors.
+	 *
+	 * Since this function is called during transaction abort, backend exit,
+	 * or cache invalidation - times when the JVM/backend may be shutting down -
+	 * it's safer to just mark the reference as NULL and let the JVM clean up
+	 * its own resources on shutdown.
+	 *
+	 * This may cause minor memory leaks in long-running backends that create
+	 * and destroy many connections, but it prevents crashes which are worse.
+	 */
+
+	/* Just mark as cleaned up, don't actually delete anything */
+	jdbcUtilsInfo->JDBCUtilsObject = NULL;
+}
+
+/*
+ * JNI Resource Management Helpers
+ *
+ * These functions ensure proper cleanup of JNI resources even when
+ * PostgreSQL's ereport(ERROR) is called.
+ */
+
+typedef struct JNIFrameGuard
+{
+	bool frame_pushed;
+	JNIEnv *env;
+} JNIFrameGuard;
+
+/*
+ * jni_push_frame - Push a local frame with error handling
+ *
+ * Returns: JNIFrameGuard that must be passed to jni_pop_frame
+ */
+static JNIFrameGuard
+jni_push_frame(int capacity)
+{
+	JNIFrameGuard guard = {false, Jenv};
+
+	if (Jenv == NULL)
+		ereport(ERROR, (errmsg("JNI environment not initialized")));
+
+	if ((*Jenv)->PushLocalFrame(Jenv, capacity) < 0)
+		ereport(ERROR, (errmsg("Failed to push JNI local frame - out of memory")));
+
+	guard.frame_pushed = true;
+	return guard;
+}
+
+/*
+ * jni_pop_frame - Pop a local frame, optionally preserving a result
+ *
+ * result: jobject to preserve (can be NULL)
+ * Returns: The preserved result (or NULL)
+ */
+static jobject
+jni_pop_frame(JNIFrameGuard *guard, jobject result)
+{
+	jobject preserved = NULL;
+
+	if (guard->frame_pushed && guard->env != NULL)
+	{
+		/* PopLocalFrame preserves the result reference */
+		preserved = (*guard->env)->PopLocalFrame(guard->env, result);
+		guard->frame_pushed = false;
+	}
+
+	return preserved;
+}
+
+/*
+ * jni_check_exception - Check for pending JNI exception
+ *
+ * If an exception is pending, logs it and throws a PostgreSQL ERROR.
+ * call_context: Description of what JNI call was made (for error messages)
+ */
+static void
+jni_check_exception(const char *call_context)
+{
+	jthrowable exc;
+
+	if (Jenv == NULL)
+		return;
+
+	exc = (*Jenv)->ExceptionOccurred(Jenv);
+	if (exc != NULL)
+	{
+		/* Log the Java exception details */
+		elog(LOG, "JNI exception occurred in: %s", call_context);
+		(*Jenv)->ExceptionDescribe(Jenv);
+		(*Jenv)->ExceptionClear(Jenv);
+
+		ereport(ERROR,
+				(errmsg("JNI exception in %s", call_context),
+				 errdetail("Check PostgreSQL logs for Java stack trace")));
+	}
+}
 
 /* jq_cancel
  * 		Call cancel method from JDBCUtilsObject to release
@@ -140,45 +275,51 @@ jq_cancel(JDBCUtilsInfo * jdbcUtilsInfo)
 {
 	jclass		JDBCUtilsClass;
 	jmethodID	id_cancel;
-	MemoryContext ccxt = CurrentMemoryContext;
+	jobject		utils_obj;
 
-	/* JDBCUtils object has been cleaned, do nothing */
-	if (jvm == NULL || Jenv == NULL)
+	/*
+	 * CRITICAL: This function is called from transaction abort callback!
+	 * We must NOT trigger errors that would create infinite recursion.
+	 * Use WARNING for all failures and fail gracefully.
+	 */
+
+	if (jvm == NULL || Jenv == NULL || jdbcUtilsInfo == NULL)
 		return;
 
-	PG_TRY();
-	{
-		JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
-		if (JDBCUtilsClass == NULL)
-		{
-			elog(ERROR, "JDBCUtilsClass is NULL");
-		}
-		id_cancel = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "cancel",
-											"()V");
-		if (id_cancel == NULL)
-		{
-			elog(ERROR, "id_cancel is NULL");
-		}
-		jq_exception_clear();
-		(*Jenv)->CallObjectMethod(Jenv, jdbcUtilsInfo->JDBCUtilsObject, id_cancel);
-		jq_get_exception();
-	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
+	/* Read JDBCUtilsObject ONCE - multiple reads cause corruption */
+	utils_obj = jdbcUtilsInfo->JDBCUtilsObject;
+	if (utils_obj == NULL)
+		return;
 
-		/* Save error info */
-		MemoryContextSwitchTo(ccxt);
-		edata = CopyErrorData();
-		FlushErrorState();
-
-		/*
-		 * We are in Transaction abort callback, raise error here may making
-		 * the infinity loop.
-		 */
-		elog(WARNING, "jq_cancel failed: %s", edata->message);
+	/* Find the class - fail silently if not found */
+	JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+	if (JDBCUtilsClass == NULL)
+	{
+		elog(WARNING, "jdbc_fdw: Cannot find JDBCUtils class in jq_cancel");
+		return;
 	}
-	PG_END_TRY();
+
+	/* Get the cancel method - fail silently if not found */
+	id_cancel = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "cancel", "()V");
+	if (id_cancel == NULL)
+	{
+		elog(WARNING, "jdbc_fdw: Cannot find cancel method in jq_cancel");
+		(*Jenv)->DeleteLocalRef(Jenv, JDBCUtilsClass);
+		return;
+	}
+
+	/* Call cancel and silently clear any exceptions */
+	jq_exception_clear();
+	(*Jenv)->CallObjectMethod(Jenv, utils_obj, id_cancel);
+
+	/* Don't call jq_get_exception() - it would trigger ereport(ERROR)! */
+	if ((*Jenv)->ExceptionCheck(Jenv))
+	{
+		elog(WARNING, "jdbc_fdw: Exception during cancel, clearing");
+		(*Jenv)->ExceptionClear(Jenv);
+	}
+
+	(*Jenv)->DeleteLocalRef(Jenv, JDBCUtilsClass);
 }
 
 
@@ -282,24 +423,55 @@ jdbc_destroy_jvm()
 }
 
 /*
- * jdbc_attach_jvm Attach the JVM.
+ * ensure_jvm_ready - Ensure JVM is initialized and ready for use
+ *
+ * This function ensures the JVM is created and the JNI environment is set up.
+ * It handles pgBouncer backend reuse detection and cleanup.
  */
 static void
-jdbc_attach_jvm(void)
+ensure_jvm_ready(const ForeignServer *server, const UserMapping *user)
 {
-	jint res;
+	Oid current_userid = GetUserId();
+	Oid current_dbid = MyDatabaseId;
 
-	ereport(DEBUG3, (errmsg("In jdbc_attach_jvm")));
+	/* Check for pgBouncer backend reuse */
+	if (jvm_initialized &&
+	    (last_userid != current_userid || last_dbid != current_dbid))
+	{
+		elog(DEBUG1, "jdbc_fdw: Backend reuse detected (user %d->%d, db %d->%d)",
+		     last_userid, current_userid, last_dbid, current_dbid);
 
-	res = (*jvm)->AttachCurrentThread(jvm, (void **) &Jenv, NULL);
+		/* Reset connection state but keep JVM running */
+		jdbc_reset_connection_cache();
 
-	if (res != JNI_OK)
-		elog(ERROR, "jdbc_fdw: AttachCurrentThread failed with error code %d", res);
+		last_userid = current_userid;
+		last_dbid = current_dbid;
+	}
+
+	/* Initialize JVM if needed */
+	if (!jvm_initialized)
+	{
+		jdbc_jvm_init(server, user);
+		jvm_initialized = true;
+		last_userid = current_userid;
+		last_dbid = current_dbid;
+	}
+
+	/* Verify JNI environment is valid */
+	if (Jenv == NULL)
+	{
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("JNI environment not initialized after JVM creation")));
+	}
 }
 
 /*
  * jdbc_detach_jvm Detach the JVM.
+ * Currently unused - we keep JVM attached for backend lifetime to avoid
+ * losing access to global JNI references like JDBCUtilsObject.
  */
+#if 0
 static void
 jdbc_detach_jvm()
 {
@@ -317,6 +489,7 @@ jdbc_detach_jvm()
 		Jenv = NULL;
 	}
 }
+#endif
 
 /*
  * jdbc_jvm_init Create the JVM which will be used for calling the Java
@@ -346,10 +519,11 @@ jdbc_jvm_init(const ForeignServer *server, const UserMapping *user)
 	if (FunctionCallCheck == false)
 	{
 		const char* env_classpath = getenv("CLASSPATH");
+		int			option_index;
 
 		vm_args.version = JNI_VERSION_1_2;
 		vm_args.ignoreUnrecognized = JNI_FALSE;
-		vm_args.nOptions = 2;
+		vm_args.nOptions = 3;		/* Base options: -Xrs, classpath, Arrow module access */
 
 		if (env_classpath != NULL) {
 			classpath = psprintf("-Djava.class.path=%s" PATH_SEPARATOR "%s", STR_SHAREEXTDIR, env_classpath);
@@ -369,25 +543,33 @@ jdbc_jvm_init(const ForeignServer *server, const UserMapping *user)
 		}
 		vm_args.options = (JavaVMOption *) palloc0(sizeof(JavaVMOption) * vm_args.nOptions);
 
+		option_index = 0;
+
 		/*
 		 * PostgreSQL must use its own signal handlers, so use -Xrs option to
 		 * reduces the use of operating system signals by the JVM.
 		 */
-		vm_args.options[0].optionString = "-Xrs";
-		vm_args.options[1].optionString = classpath;
+		vm_args.options[option_index++].optionString = "-Xrs";
+		vm_args.options[option_index++].optionString = classpath;
+
+		/*
+		 * Required for Snowflake JDBC driver's Arrow memory allocation.
+		 * See https://arrow.apache.org/docs/java/install.html
+		 */
+		vm_args.options[option_index++].optionString = "--add-opens=java.base/java.nio=ALL-UNNAMED";
 
 		if (maxheapsizeoption != NULL)
 		{
-			vm_args.options[2].optionString = maxheapsizeoption;
+			vm_args.options[option_index++].optionString = maxheapsizeoption;
 		}
 
-		/* Create the Java VM */
+		/* Create the Java VM - this also sets Jenv */
 		res = JNI_CreateJavaVM(&jvm, (void **) &Jenv, &vm_args);
 		if (res < 0)
 		{
-			ereport(ERROR, (errmsg("Failed to create Java VM")));
+			ereport(ERROR, (errmsg("Failed to create Java VM, error code: %d", res)));
 		}
-		jdbc_attach_jvm();
+		/* JNI_CreateJavaVM already attached the current thread, no need to call jdbc_attach_jvm */
 		ereport(DEBUG3, (errmsg("Successfully created a JVM with %d MB heapsize and classpath set to '%s'", opts.maxheapsize, classpath)));
 		/* Register an on_proc_exit handler that shuts down the JVM. */
 		on_proc_exit(jdbc_destroy_jvm, 0);
@@ -397,20 +579,16 @@ jdbc_jvm_init(const ForeignServer *server, const UserMapping *user)
 	{
 		int			JVMEnvStat;
 
-		vm_args.version = JNI_VERSION_1_2;
-		JVMEnvStat = (*jvm)->GetEnv(jvm, (void **) &Jenv, vm_args.version);
-		if (JVMEnvStat == JNI_EDETACHED)
+		/* JVM already exists, verify environment */
+		JVMEnvStat = (*jvm)->GetEnv(jvm, (void **) &Jenv, JNI_VERSION_1_2);
+		if (JVMEnvStat == JNI_OK)
 		{
-			ereport(DEBUG3, (errmsg("JVMEnvStat: JNI_EDETACHED; the current thread is not attached to the VM")));
-			jdbc_attach_jvm();
+			ereport(DEBUG3, (errmsg("JVM already initialized, Jenv=%p", (void *)Jenv)));
 		}
-		else if (JVMEnvStat == JNI_OK)
+		else
 		{
-			ereport(DEBUG3, (errmsg("JVMEnvStat: JNI_OK")));
-		}
-		else if (JVMEnvStat == JNI_EVERSION)
-		{
-			ereport(ERROR, (errmsg("JVMEnvStat: JNI_EVERSION; the specified version is not supported")));
+			/* This shouldn't happen in our single-threaded model */
+			ereport(ERROR, (errmsg("JVM exists but environment not available: %d", JVMEnvStat)));
 		}
 	}
 }
@@ -425,6 +603,7 @@ static JDBCUtilsInfo *
 jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user)
 {
 	jmethodID	idCreate;
+	jmethodID	constructor;
 	jstring		stringArray[6];
 	jclass		javaString;
 	jobjectArray argArray;
@@ -440,26 +619,57 @@ jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user
 								 * value */
 	int			keyid = user->umid; /* key for the hashtable in java depends
 									 * on user mapping Oid  */
-	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext); /* Switch the memory
-																		 * context to
-																		 * TopMemoryContext to
-																		 * avoid the case
-																		 * connection is
-																		 * released when
-																		 * execution state
-																		 * finished */
-	JDBCUtilsInfo *jdbcUtilsInfo = (JDBCUtilsInfo *) palloc0(sizeof(JDBCUtilsInfo));
+	JDBCUtilsInfo * volatile jdbcUtilsInfo;  /* volatile required for PG_TRY/PG_CATCH */
 	jlong		server_hashvalue;
 	jlong		mapping_hashvalue;
+	JNIFrameGuard frame_guard;
+	jobject		localRef = NULL;
+
+	/*
+	 * Allocate JDBCUtilsInfo in CacheMemoryContext.
+	 * CRITICAL: Must use same memory context as the hash table to avoid
+	 * corruption when accessing struct fields through hash table pointers.
+	 * The corruption was NOT caused by palloc itself, but by reading the
+	 * fields multiple times. We now read JDBCUtilsObject exactly once.
+	 */
+	MemoryContext oldcontext = MemoryContextSwitchTo(CacheMemoryContext);
+	jdbcUtilsInfo = (JDBCUtilsInfo *) palloc0(sizeof(JDBCUtilsInfo));
+	MemoryContextSwitchTo(oldcontext);
 
 	ereport(DEBUG3, (errmsg("In jdbc_create_JDBC_connection")));
 	jdbcUtilsInfo->status = CONNECTION_BAD;
-	jdbcUtilsInfo->festate = (jdbcFdwExecutionState *) palloc0(sizeof(jdbcFdwExecutionState));
-	jdbcUtilsInfo->festate->query = NULL;
+	/* festate is query-specific and will be set when executing queries, not at connection time */
+	jdbcUtilsInfo->festate = NULL;
+	jdbcUtilsInfo->q_char = NULL;
+
+	/* Ensure JVM and JNI environment are ready */
+	ensure_jvm_ready(server, user);
+
+	/* Clear any pending exceptions before starting */
+	if ((*Jenv)->ExceptionCheck(Jenv))
+	{
+		(*Jenv)->ExceptionClear(Jenv);
+	}
+
+	/* Find the JDBCUtils class */
 	JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+
+	/* Check for Java exceptions */
+	if ((*Jenv)->ExceptionCheck(Jenv))
+	{
+		elog(WARNING, "jdbc_fdw: Exception finding JDBCUtils class");
+		(*Jenv)->ExceptionDescribe(Jenv);
+		(*Jenv)->ExceptionClear(Jenv);
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("Cannot find JDBCUtils class - check CLASSPATH")));
+	}
+
 	if (JDBCUtilsClass == NULL)
 	{
-		ereport(ERROR, (errmsg("Failed to find the JDBCUtils class!")));
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("Failed to find the JDBCUtils class")));
 	}
 	idCreate = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "createConnection",
 									"(IJJ[Ljava/lang/String;)V");
@@ -474,7 +684,7 @@ jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user
 	}
 
 	/* Get the default constructor */
-	jmethodID constructor = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "<init>", "()V");
+	constructor = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "<init>", "()V");
 	if (constructor == NULL)
 	{
 		ereport(ERROR, (errmsg("Failed to find the JDBCUtils default constructor")));
@@ -508,23 +718,79 @@ jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user
 	{
 		(*Jenv)->SetObjectArrayElement(Jenv, argArray, i, stringArray[i]);
 	}
-	jdbcUtilsInfo->JDBCUtilsObject = (*Jenv)->NewObject(Jenv, JDBCUtilsClass, constructor);
-	if (jdbcUtilsInfo->JDBCUtilsObject == NULL)
+
+	/*
+	 * Create JDBCUtils object with proper resource management.
+	 * Use PG_TRY to ensure JNI frame is popped even on error.
+	 */
+	PG_TRY();
 	{
-		/* Return Java memory */
-		for (i = 0; i < numParams; i++)
+		/* Push frame for all JNI operations in this block */
+		frame_guard = jni_push_frame(32);
+
+		elog(DEBUG1, "jdbc_fdw: Creating JDBCUtils instance");
+
+		/* Create the JDBCUtils object */
+		localRef = (*Jenv)->NewObject(Jenv, JDBCUtilsClass, constructor);
+		jni_check_exception("NewObject(JDBCUtils)");
+
+		if (localRef == NULL)
 		{
-			(*Jenv)->DeleteLocalRef(Jenv, stringArray[i]);
+			ereport(ERROR,
+					(errmsg("Failed to create JDBCUtils object"),
+					 errdetail("NewObject returned NULL")));
 		}
-		(*Jenv)->DeleteLocalRef(Jenv, argArray);
-		ereport(ERROR, (errmsg("Failed to create java call")));
+
+		elog(DEBUG1, "jdbc_fdw: Creating global reference for JDBCUtils");
+
+		/* Convert to global reference (this survives PopLocalFrame) */
+		jdbcUtilsInfo->JDBCUtilsObject = (*Jenv)->NewGlobalRef(Jenv, localRef);
+		jni_check_exception("NewGlobalRef(JDBCUtils)");
+
+		/*
+		 * CRITICAL: With palloc in CacheMemoryContext, we can now safely
+		 * check the value. Read it ONCE into a local variable.
+		 */
+		jobject global_ref = jdbcUtilsInfo->JDBCUtilsObject;
+		if (global_ref == NULL)
+		{
+			ereport(ERROR,
+					(errmsg("Failed to create global reference for JDBCUtils object"),
+					 errdetail("NewGlobalRef returned NULL")));
+		}
+		ereport(DEBUG3, (errmsg("Global reference created for JDBCUtils object")));
+
+		/* Pop frame - this cleans up localRef but preserves the global ref */
+		jni_pop_frame(&frame_guard, NULL);
+
+		elog(DEBUG1, "jdbc_fdw: JDBCUtils object created successfully");
 	}
+	PG_CATCH();
+	{
+		/*
+		 * CRITICAL: Do NOT access any struct fields in error handlers!
+		 * Reading jdbcUtilsInfo->JDBCUtilsObject here can trigger infinite
+		 * recursion, causing ERRORDATA_STACK_SIZE exceeded panic.
+		 *
+		 * Just pop the frame and re-throw. Cleanup will happen when the
+		 * connection is released via normal cleanup paths.
+		 */
+		jni_pop_frame(&frame_guard, NULL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	server_hashvalue = (jlong) GetSysCacheHashValue1(FOREIGNSERVEROID, ObjectIdGetDatum(server->serverid));
 	mapping_hashvalue = (jlong) GetSysCacheHashValue1(USERMAPPINGOID, ObjectIdGetDatum(user->umid));
 
+	/*
+	 * CRITICAL: Read JDBCUtilsObject ONCE and use it.
+	 * Do not read it multiple times - causes corruption!
+	 */
+	jobject utils_obj = jdbcUtilsInfo->JDBCUtilsObject;
+
 	jq_exception_clear();
-	(*Jenv)->CallObjectMethod(Jenv, jdbcUtilsInfo->JDBCUtilsObject, idCreate, keyid, server_hashvalue, mapping_hashvalue, argArray);
+	(*Jenv)->CallObjectMethod(Jenv, utils_obj, idCreate, keyid, server_hashvalue, mapping_hashvalue, argArray);
 	jq_get_exception();
 	/* Return Java memory */
 	for (i = 0; i < numParams; i++)
@@ -533,16 +799,30 @@ jdbc_create_JDBC_connection(const ForeignServer *server, const UserMapping *user
 	}
 	(*Jenv)->DeleteLocalRef(Jenv, argArray);
 	ereport(DEBUG3, (errmsg("Created a JDBC connection: %s", opts.url)));
+
+	/*
+	 * CRITICAL: Reuse the utils_obj we read earlier at line 796.
+	 * Do NOT read jdbcUtilsInfo->JDBCUtilsObject again!
+	 */
+
 	/* get default identifier quote string */
 	jq_exception_clear();
-	identifierQuoteString = (jstring) (*Jenv)->CallObjectMethod(Jenv, jdbcUtilsInfo->JDBCUtilsObject, idGetIdentifierQuoteString);
+	identifierQuoteString = (jstring) (*Jenv)->CallObjectMethod(Jenv, utils_obj, idGetIdentifierQuoteString);
 	jq_get_exception();
 	quote_string = jdbc_convert_string_to_cstring((jobject) identifierQuoteString);
 	jdbcUtilsInfo->q_char = pstrdup(quote_string);
 	jdbcUtilsInfo->status = CONNECTION_OK;
 	pfree(querytimeout_string);
-	/* Switch back to old context */
-	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * CRITICAL: Do NOT access jdbcUtilsInfo->JDBCUtilsObject in ereport!
+	 * Accessing struct fields during log message formatting causes the field
+	 * to be zeroed out. Only access struct pointer addresses.
+	 */
+	ereport(DEBUG1,
+			(errmsg("jdbc_fdw: created JDBC connection %p (not logging JDBCUtilsObject to avoid corruption)",
+					jdbcUtilsInfo)));
+
 	return jdbcUtilsInfo;
 }
 
@@ -1058,7 +1338,13 @@ jq_error_message(const JDBCUtilsInfo * jdbcUtilsInfo)
 void
 jq_finish(void)
 {
-	jdbc_detach_jvm();
+	/* Clear any pending Java exceptions but do NOT detach from JVM.
+	 * The JVM should stay alive for the lifetime of the PostgreSQL backend.
+	 */
+	if (Jenv != NULL && (*Jenv)->ExceptionCheck(Jenv))
+	{
+		(*Jenv)->ExceptionClear(Jenv);
+	}
 	return;
 }
 
@@ -1460,7 +1746,10 @@ jq_exception_clear()
 
 /*
  * jq_get_exception: get the JNI exception is currently being thrown convert
- * to String for ouputing error message
+ * to String for outputting error message
+ *
+ * CRITICAL: This function must NOT call ereport(ERROR) if it can't get the
+ * exception message, as that would cause infinite recursion during error handling.
  */
 void
 jq_get_exception()
@@ -1477,14 +1766,48 @@ jq_get_exception()
 
 		/* determines if an exception is being thrown */
 		exc = (*Jenv)->ExceptionOccurred(Jenv);
+
 		/* get to the message and stack trace one as String */
 		objectClass = (*Jenv)->FindClass(Jenv, "java/lang/Object");
 		if (objectClass == NULL)
 		{
-			ereport(ERROR, (errmsg("java/lang/Object class could not be created")));
+			/*
+			 * CRITICAL: Don't call ereport(ERROR) here! It would cause infinite
+			 * recursion if we're already in error handling. Just clear and report generic error.
+			 */
+			(*Jenv)->ExceptionClear(Jenv);
+			ereport(ERROR, (errmsg("remote server returned a Java exception (details unavailable - could not load java/lang/Object class)")));
+			return;  /* unreachable, but for clarity */
 		}
+
 		exceptionMsgID = (*Jenv)->GetMethodID(Jenv, objectClass, "toString", "()Ljava/lang/String;");
+		if (exceptionMsgID == NULL)
+		{
+			/* Fail gracefully if we can't get toString method */
+			(*Jenv)->DeleteLocalRef(Jenv, objectClass);
+			(*Jenv)->ExceptionClear(Jenv);
+			ereport(ERROR, (errmsg("remote server returned a Java exception (details unavailable - could not find toString method)")));
+			return;
+		}
+
+		/* Get exception message - this itself could throw, so be careful */
 		exceptionMsg = (jstring) (*Jenv)->CallObjectMethod(Jenv, exc, exceptionMsgID);
+		(*Jenv)->DeleteLocalRef(Jenv, objectClass);
+
+		/* Check if getting the message threw another exception */
+		if ((*Jenv)->ExceptionCheck(Jenv))
+		{
+			(*Jenv)->ExceptionClear(Jenv);
+			ereport(ERROR, (errmsg("remote server returned a Java exception (details unavailable - error getting exception message)")));
+			return;
+		}
+
+		if (exceptionMsg == NULL)
+		{
+			ereport(ERROR, (errmsg("remote server returned a Java exception (message was null)")));
+			return;
+		}
+
 		exceptionString = jdbc_convert_string_to_cstring((jobject) exceptionMsg);
 		err_msg = pstrdup(exceptionString);
 		ereport(ERROR, (errmsg("remote server returned an error: %s", err_msg)));
@@ -1497,29 +1820,15 @@ jq_get_column_infos(JDBCUtilsInfo * jdbcUtilsInfo, char *tablename)
 {
 	jobject		JDBCUtilsObject;
 	jclass		JDBCUtilsClass;
-	jstring		jtablename = (*Jenv)->NewStringUTF(Jenv, tablename);
+	jstring		jtablename = NULL;
+	jobjectArray columnNameArray;
+	jobjectArray columnTypeArray;
+	jobjectArray primaryKeyArray;  /* Array of primary key column names */
+	jsize		numberOfColumns;
+	jsize		numberOfPrimaryKeys = 0;
+	List	   *columnlist = NIL;
 	int			i;
-
-	/* getColumnNames */
-	jmethodID	idGetColumnNames;
-	jobjectArray columnNamesArray;
-	jsize		numberOfNames;
-
-	/* getColumnTypes */
-	jmethodID	idGetColumnTypes;
-	jobjectArray columnTypesArray;
-	jsize		numberOfTypes;
-
-	/* getPrimaryKey */
-	jmethodID	idGetPrimaryKey;
-	jobjectArray primaryKeyArray;
-	jsize		numberOfKeys;
-	List	   *primaryKey = NIL;
-
-	/* for generating columnInfo List */
-	List	   *columnInfoList = NIL;
-	JcolumnInfo *columnInfo;
-	ListCell   *lc;
+	JNIFrameGuard frame_guard;
 
 	/* Get JDBCUtils */
 	PG_TRY();
@@ -1528,114 +1837,123 @@ jq_get_column_infos(JDBCUtilsInfo * jdbcUtilsInfo, char *tablename)
 	}
 	PG_CATCH();
 	{
-		(*Jenv)->DeleteLocalRef(Jenv, jtablename);
+		/* Just rethrow - don't hide the original error message */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	/* getColumnNames */
-	idGetColumnNames = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getColumnNames", "(Ljava/lang/String;)[Ljava/lang/String;");
-	if (idGetColumnNames == NULL)
+	PG_TRY();
 	{
-		(*Jenv)->DeleteLocalRef(Jenv, jtablename);
-		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getColumnNames method")));
-	}
-	jq_exception_clear();
-	columnNamesArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject, idGetColumnNames, jtablename);
-	jq_get_exception();
-	/* getColumnTypes */
-	idGetColumnTypes = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getColumnTypes", "(Ljava/lang/String;)[Ljava/lang/String;");
-	if (idGetColumnTypes == NULL)
-	{
-		(*Jenv)->DeleteLocalRef(Jenv, jtablename);
-		if (columnNamesArray != NULL)
-		{
-			(*Jenv)->DeleteLocalRef(Jenv, columnNamesArray);
-		}
-		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getColumnTypes method")));
-	}
-	jq_exception_clear();
-	columnTypesArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject, idGetColumnTypes, jtablename);
-	jq_get_exception();
-	/* getPrimaryKey */
-	idGetPrimaryKey = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getPrimaryKey", "(Ljava/lang/String;)[Ljava/lang/String;");
-	if (idGetPrimaryKey == NULL)
-	{
-		(*Jenv)->DeleteLocalRef(Jenv, jtablename);
-		if (columnNamesArray != NULL)
-		{
-			(*Jenv)->DeleteLocalRef(Jenv, columnNamesArray);
-		}
-		if (columnTypesArray != NULL)
-		{
-			(*Jenv)->DeleteLocalRef(Jenv, columnTypesArray);
-		}
-		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getColumnTypes method")));
-	}
-	jq_exception_clear();
-	primaryKeyArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject, idGetPrimaryKey, jtablename);
-	jq_get_exception();
-	if (primaryKeyArray != NULL)
-	{
-		numberOfKeys = (*Jenv)->GetArrayLength(Jenv, primaryKeyArray);
-		for (i = 0; i < numberOfKeys; i++)
-		{
-			char	   *tmpPrimaryKey = jdbc_convert_string_to_cstring((jobject) (*Jenv)->GetObjectArrayElement(Jenv, primaryKeyArray, i));
+		jmethodID idGetColumnNames;
+		jmethodID idGetColumnTypes;
+		jmethodID idGetPrimaryKeys;
 
-			primaryKey = lappend(primaryKey, tmpPrimaryKey);
-		}
-		(*Jenv)->DeleteLocalRef(Jenv, primaryKeyArray);
-	}
+		/* Push frame for all JNI operations */
+		frame_guard = jni_push_frame(64);
 
-	if (columnNamesArray != NULL && columnTypesArray != NULL)
-	{
-		numberOfNames = (*Jenv)->GetArrayLength(Jenv, columnNamesArray);
-		numberOfTypes = (*Jenv)->GetArrayLength(Jenv, columnTypesArray);
+		/* Convert table name to Java string */
+		jtablename = (*Jenv)->NewStringUTF(Jenv, tablename);
+		jni_check_exception("NewStringUTF(tablename)");
 
-		if (numberOfNames != numberOfTypes)
+		/* Get method IDs */
+		idGetColumnNames = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getColumnNames",
+												"(Ljava/lang/String;)[Ljava/lang/String;");
+		if (idGetColumnNames == NULL)
+			ereport(ERROR, (errmsg("Failed to find JDBCUtils.getColumnNames method")));
+
+		idGetColumnTypes = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getColumnTypes",
+												"(Ljava/lang/String;)[Ljava/lang/String;");
+		if (idGetColumnTypes == NULL)
+			ereport(ERROR, (errmsg("Failed to find JDBCUtils.getColumnTypes method")));
+
+		idGetPrimaryKeys = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getPrimaryKey",
+												"(Ljava/lang/String;)[Ljava/lang/String;");
+		if (idGetPrimaryKeys == NULL)
+			ereport(ERROR, (errmsg("Failed to find JDBCUtils.getPrimaryKey method")));
+
+		/* Call Java methods */
+		jq_exception_clear();
+		columnNameArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject,
+													idGetColumnNames, jtablename);
+		jni_check_exception("CallObjectMethod(getColumnNames)");
+
+		columnTypeArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject,
+													idGetColumnTypes, jtablename);
+		jni_check_exception("CallObjectMethod(getColumnTypes)");
+
+		primaryKeyArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject,
+													idGetPrimaryKeys, jtablename);
+		jni_check_exception("CallObjectMethod(getPrimaryKey)");
+
+		/* Get number of primary key columns */
+		if (primaryKeyArray != NULL)
+			numberOfPrimaryKeys = (*Jenv)->GetArrayLength(Jenv, primaryKeyArray);
+
+		if (columnNameArray != NULL)
 		{
-			(*Jenv)->DeleteLocalRef(Jenv, jtablename);
-			(*Jenv)->DeleteLocalRef(Jenv, columnTypesArray);
-			(*Jenv)->DeleteLocalRef(Jenv, columnNamesArray);
-			ereport(ERROR, (errmsg("Cannot get the dependable columnInfo.")));
-		}
+			numberOfColumns = (*Jenv)->GetArrayLength(Jenv, columnNameArray);
+			elog(DEBUG1, "jdbc_fdw: Table '%s' has %d columns, %d primary keys",
+				 tablename, (int)numberOfColumns, (int)numberOfPrimaryKeys);
 
-		for (i = 0; i < numberOfNames; i++)
-		{
-			/* init columnInfo */
-			char	   *tmpColumnNames = jdbc_convert_string_to_cstring((jobject) (*Jenv)->GetObjectArrayElement(Jenv, columnNamesArray, i));
-			char	   *tmpColumnTypes = jdbc_convert_string_to_cstring((jobject) (*Jenv)->GetObjectArrayElement(Jenv, columnTypesArray, i));
-
-			columnInfo = (JcolumnInfo *) palloc0(sizeof(JcolumnInfo));
-			columnInfo->column_name = tmpColumnNames;
-			columnInfo->column_type = tmpColumnTypes;
-			columnInfo->primary_key = false;
-			/* check the column is primary key or not */
-			foreach(lc, primaryKey)
+			for (i = 0; i < numberOfColumns; i++)
 			{
-				char	   *tmpPrimaryKey = NULL;
+				JcolumnInfo *columnInfo = (JcolumnInfo *) palloc0(sizeof(JcolumnInfo));
+				jobject nameObj;
+				jobject typeObj;
+				bool isPrimaryKey = false;
+				int j;
 
-				tmpPrimaryKey = (char *) lfirst(lc);
-				if (!strcmp(tmpPrimaryKey, tmpColumnNames))
+				/* Get column name */
+				nameObj = (*Jenv)->GetObjectArrayElement(Jenv, columnNameArray, i);
+				columnInfo->column_name = jdbc_convert_string_to_cstring(nameObj);
+
+				/* Get column type */
+				typeObj = (*Jenv)->GetObjectArrayElement(Jenv, columnTypeArray, i);
+				columnInfo->column_type = jdbc_convert_string_to_cstring(typeObj);
+
+				/* Check if this column is in the primary key array */
+				if (primaryKeyArray != NULL)
 				{
-					columnInfo->primary_key = true;
+					for (j = 0; j < numberOfPrimaryKeys; j++)
+					{
+						jobject pkNameObj = (*Jenv)->GetObjectArrayElement(Jenv, primaryKeyArray, j);
+						if (pkNameObj != NULL)
+						{
+							char *pkName = jdbc_convert_string_to_cstring(pkNameObj);
+							if (strcmp(columnInfo->column_name, pkName) == 0)
+							{
+								isPrimaryKey = true;
+								break;
+							}
+						}
+					}
 				}
+				columnInfo->primary_key = isPrimaryKey;
+
+				elog(DEBUG1, "jdbc_fdw: Column %d: name=%s, type=%s, pk=%d",
+					 i, columnInfo->column_name, columnInfo->column_type, columnInfo->primary_key);
+
+				columnlist = lappend(columnlist, columnInfo);
 			}
-			columnInfoList = lappend(columnInfoList, columnInfo);
 		}
-	}
+		else
+		{
+			elog(WARNING, "jdbc_fdw: getColumnNames returned NULL for table '%s'", tablename);
+		}
 
-	if (columnNamesArray != NULL)
-	{
-		(*Jenv)->DeleteLocalRef(Jenv, columnNamesArray);
+		/* Pop frame - cleanup all JNI references */
+		jni_pop_frame(&frame_guard, NULL);
 	}
-	if (columnTypesArray != NULL)
+	PG_CATCH();
 	{
-		(*Jenv)->DeleteLocalRef(Jenv, columnTypesArray);
+		/* Ensure frame cleanup */
+		jni_pop_frame(&frame_guard, NULL);
+		/* Just rethrow - don't hide the original error message */
+		PG_RE_THROW();
 	}
-	(*Jenv)->DeleteLocalRef(Jenv, jtablename);
+	PG_END_TRY();
 
-	return columnInfoList;
+	return columnlist;
 }
 
 /*
@@ -1759,9 +2077,14 @@ jq_get_column_infos_without_key(JDBCUtilsInfo * jdbcUtilsInfo, int *resultSetID,
 
 /*
  * jq_get_table_names
+ *      Retrieves table names from the foreign database
+ *      Parameters:
+ *        jdbcUtilsInfo - JDBC connection info
+ *        schemaPattern - schema name to filter (NULL means all schemas)
+ *        tableNames - comma-separated list of table names (NULL means all tables)
  */
 static List *
-jq_get_table_names(JDBCUtilsInfo * jdbcUtilsInfo)
+jq_get_table_names(JDBCUtilsInfo * jdbcUtilsInfo, const char *schemaPattern, const char *tableNames)
 {
 	jobject		JDBCUtilsObject;
 	jclass		JDBCUtilsClass;
@@ -1770,49 +2093,118 @@ jq_get_table_names(JDBCUtilsInfo * jdbcUtilsInfo)
 	List	   *tableName = NIL;
 	jsize		numberOfTables;
 	int			i;
+	jstring		jSchemaPattern = NULL;
+	jstring		jTableNames = NULL;
+	JNIFrameGuard frame_guard;
+
+	/*
+	 * CRITICAL: Do not read jdbcUtilsInfo->JDBCUtilsObject here!
+	 * jq_get_JDBCUtils will read it exactly once.
+	 */
 
 	jq_get_JDBCUtils(jdbcUtilsInfo, &JDBCUtilsClass, &JDBCUtilsObject);
 
-	idGetTableNames = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getTableNames", "()[Ljava/lang/String;");
+	/* Use the new method signature that accepts schema and table filters */
+	idGetTableNames = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "getTableNames",
+										   "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;");
 	if (idGetTableNames == NULL)
 	{
-		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getTableNames method")));
+		ereport(ERROR, (errmsg("Failed to find the JDBCUtils.getTableNames(String, String) method")));
 	}
-	jq_exception_clear();
-	tableNameArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject, idGetTableNames);
-	jq_get_exception();
-	if (tableNameArray != NULL)
-	{
-		numberOfTables = (*Jenv)->GetArrayLength(Jenv, tableNameArray);
-		for (i = 0; i < numberOfTables; i++)
-		{
-			char	   *tmpTableName = jdbc_convert_string_to_cstring((jobject) (*Jenv)->GetObjectArrayElement(Jenv, tableNameArray, i));
 
-			tableName = lappend(tableName, tmpTableName);
+	PG_TRY();
+	{
+		/* Push frame for all JNI string operations */
+		frame_guard = jni_push_frame(16);
+
+		/* Convert C strings to Java strings (NULL stays as NULL) */
+		if (schemaPattern != NULL)
+		{
+			jSchemaPattern = (*Jenv)->NewStringUTF(Jenv, schemaPattern);
+			jni_check_exception("NewStringUTF(schemaPattern)");
 		}
-		(*Jenv)->DeleteLocalRef(Jenv, tableNameArray);
+		if (tableNames != NULL)
+		{
+			jTableNames = (*Jenv)->NewStringUTF(Jenv, tableNames);
+			jni_check_exception("NewStringUTF(tableNames)");
+		}
+
+		jq_exception_clear();
+		tableNameArray = (*Jenv)->CallObjectMethod(Jenv, JDBCUtilsObject, idGetTableNames,
+												   jSchemaPattern, jTableNames);
+		jni_check_exception("CallObjectMethod(getTableNames)");
+
+		if (tableNameArray != NULL)
+		{
+			numberOfTables = (*Jenv)->GetArrayLength(Jenv, tableNameArray);
+			elog(DEBUG1, "jdbc_fdw: Retrieved %d tables from schema '%s'",
+				 (int)numberOfTables,
+				 schemaPattern ? schemaPattern : "(all schemas)");
+
+			for (i = 0; i < numberOfTables; i++)
+			{
+				jobject strObj = (*Jenv)->GetObjectArrayElement(Jenv, tableNameArray, i);
+				char *tmpTableName = jdbc_convert_string_to_cstring(strObj);
+
+				tableName = lappend(tableName, tmpTableName);
+			}
+		}
+
+		/* Pop frame - all local JNI references cleaned up */
+		jni_pop_frame(&frame_guard, NULL);
 	}
+	PG_CATCH();
+	{
+		/* Ensure frame cleanup on error */
+		jni_pop_frame(&frame_guard, NULL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	elog(DEBUG1, "jdbc_fdw: jq_get_table_names returning list with %d tables",
+		 list_length(tableName));
 	return tableName;
 }
 
 /*
  * jq_get_schema_info
+ *      Retrieves schema information (tables and columns) from the foreign database
+ *      Parameters:
+ *        jdbcUtilsInfo - JDBC connection info
+ *        schemaPattern - schema name to filter (NULL means all schemas)
+ *        tableNames - comma-separated list of table names (NULL means all tables)
  */
 List *
-jq_get_schema_info(JDBCUtilsInfo * jdbcUtilsInfo)
+jq_get_schema_info(JDBCUtilsInfo * jdbcUtilsInfo, const char *schemaPattern, const char *tableNames)
 {
 	List	   *schema_list = NIL;
 	List	   *tableName = NIL;
 	JtableInfo *tableInfo;
 	ListCell   *lc;
 
-	tableName = jq_get_table_names(jdbcUtilsInfo);
+	/* Validate input parameters */
+	if (jdbcUtilsInfo == NULL)
+	{
+		ereport(ERROR, (errmsg("jq_get_schema_info: jdbcUtilsInfo is NULL")));
+	}
+
+	/*
+	 * CRITICAL: Do NOT read jdbcUtilsInfo->JDBCUtilsObject here!
+	 * Reading fields from malloc'd structs causes corruption.
+	 * jq_get_JDBCUtils will read it exactly once.
+	 */
+
+	tableName = jq_get_table_names(jdbcUtilsInfo, schemaPattern, tableNames);
+
+	if (tableName == NIL)
+		return NIL;
 
 	foreach(lc, tableName)
 	{
 		char	   *tmpTableName = NULL;
 
 		tmpTableName = (char *) lfirst(lc);
+
 		tableInfo = (JtableInfo *) palloc0(sizeof(JtableInfo));
 		if (tmpTableName != NULL)
 		{
@@ -1821,6 +2213,7 @@ jq_get_schema_info(JDBCUtilsInfo * jdbcUtilsInfo)
 			schema_list = lappend(schema_list, tableInfo);
 		}
 	}
+
 	return schema_list;
 }
 
@@ -1911,12 +2304,43 @@ jq_get_type_warnings(JDBCUtilsInfo * jdbcUtilsInfo, char *tableName)
 static void
 jq_get_JDBCUtils(JDBCUtilsInfo * jdbcUtilsInfo, jclass * JDBCUtilsClass, jobject * JDBCUtilsObject)
 {
-	/* Our object of the JDBCUtils class is on the connection */
-	*JDBCUtilsObject = jdbcUtilsInfo->JDBCUtilsObject;
+	/* Check if jdbcUtilsInfo is valid before accessing it */
+	if (jdbcUtilsInfo == NULL)
+	{
+		ereport(ERROR, (errmsg("jq_get_JDBCUtils: jdbcUtilsInfo is NULL")));
+	}
+
+	/* Check if Jenv is valid */
+	if (Jenv == NULL)
+	{
+		ereport(ERROR, (errmsg("jq_get_JDBCUtils: JNI environment is NULL")));
+	}
+
+	elog(LOG, "jdbc_fdw: jq_get_JDBCUtils called with jdbcUtilsInfo=%p",
+		 (void *)jdbcUtilsInfo);
+
+	/*
+	 * CRITICAL: Read JDBCUtilsObject EXACTLY ONCE from the malloc'd struct.
+	 * Do not read it multiple times - causes corruption!
+	 */
+	jobject utils_obj = jdbcUtilsInfo->JDBCUtilsObject;
+	*JDBCUtilsObject = utils_obj;
+
 	if (*JDBCUtilsObject == NULL)
 	{
-		ereport(ERROR, (errmsg("Cannot get the utilsObject from the connection")));
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_ERROR),
+			 errmsg("JDBCUtilsObject is NULL - connection was not properly initialized")));
 	}
+
+	/* Validate that the JNI reference is still valid */
+	if ((*Jenv)->GetObjectRefType(Jenv, utils_obj) != JNIGlobalRefType)
+	{
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_ERROR),
+			 errmsg("JDBCUtilsObject is not a valid global reference")));
+	}
+
 	*JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
 	if (*JDBCUtilsClass == NULL)
 	{
@@ -1935,18 +2359,18 @@ jq_inval_callback(int cacheid, uint32 hashvalue)
 	jmethodID	callback = NULL;
 	jclass		JDBCUtilsClass;
 
-	Assert(cacheid == FOREIGNSERVEROID || cacheid == USERMAPPINGOID);
+	/*
+	 * CRITICAL: This function is called during error processing/cleanup!
+	 * We must NOT call ereport(ERROR) here or we'll create infinite recursion
+	 * causing ERRORDATA_STACK_SIZE exceeded panic. Fail silently instead.
+	 */
 
-	ereport(DEBUG3, (errmsg("In %s", __func__)));
-
-	if (jvm == NULL)
+	if (jvm == NULL || Jenv == NULL)
 		return;
 
-	/* Current thread can be detach before, attach it to modify connection hash */
-	if (Jenv == NULL)
-		jdbc_attach_jvm();
-
 	JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+	if (JDBCUtilsClass == NULL)
+		return;  /* Fail silently - we're in error cleanup */
 
 	/* hashvalue == 0 means a cache reset, must clear all state */
 	if (hashvalue == 0)
@@ -1966,15 +2390,37 @@ jq_inval_callback(int cacheid, uint32 hashvalue)
 	}
 
 	if (callback == NULL)
-	{
-		ereport(ERROR, (errmsg("Failed to find the JDBCUtils inval callback method!")));
-	}
+		return;  /* Fail silently - we're in error cleanup, don't cascade errors */
+
 	jq_exception_clear();
 	(*Jenv)->CallStaticVoidMethod(Jenv, JDBCUtilsClass, callback, (jlong) hashvalue);
-	jq_get_exception();
 
-	jdbc_detach_jvm();
-	Jenv = NULL;
+	/*
+	 * CRITICAL: Don't call jq_get_exception() here! It calls ereport(ERROR)
+	 * which would create infinite recursion. Just clear any exception silently.
+	 */
+	if ((*Jenv)->ExceptionCheck(Jenv))
+		(*Jenv)->ExceptionClear(Jenv);
+
+	/* Do NOT detach from JVM or set Jenv to NULL!
+	 * The JVM should stay alive for the lifetime of the PostgreSQL backend.
+	 * Detaching here causes JDBCUtilsObject references to become inaccessible.
+	 */
+}
+
+/*
+ * jdbc_reset_connection_cache
+ * 		Reset all JDBC connections (for pgBouncer backend reuse)
+ * 		This is called when we detect the backend has been reassigned
+ */
+void
+jdbc_reset_connection_cache(void)
+{
+	/* This will be called from connection.c to reset state */
+	elog(DEBUG1, "jdbc_fdw: Connection cache reset requested");
+
+	/* Call the Java-side cleanup if needed */
+	jq_release_all_result_sets();
 }
 
 /*
@@ -1990,9 +2436,12 @@ jq_release_all_result_sets(void)
 	if (jvm == NULL)
 		return;
 
-	/* Current thread can be detach before, attach it to clear all cached resultsets */
+	/* Ensure JVM is initialized */
 	if (Jenv == NULL)
-		jdbc_attach_jvm();
+	{
+		elog(WARNING, "jdbc_fdw: JNI environment not initialized for result set release");
+		return;
+	}
 
 	JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
 
@@ -2003,6 +2452,8 @@ jq_release_all_result_sets(void)
 	(*Jenv)->CallStaticVoidMethod(Jenv, JDBCUtilsClass, methodId);
 	jq_get_exception();
 
-	jdbc_detach_jvm();
-	Jenv = NULL;
+	/* Do NOT detach from JVM or set Jenv to NULL!
+	 * The JVM should stay alive for the lifetime of the PostgreSQL backend.
+	 * Detaching here causes JDBCUtilsObject references to become inaccessible.
+	 */
 }

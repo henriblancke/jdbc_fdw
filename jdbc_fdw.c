@@ -3142,6 +3142,9 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	List	   *schema_list = NIL;
 	bool		first_column;
 	ErrorContextCallback *errcallback = jdbc_register_error_callback();
+	char	   *remote_schema;
+	char	   *table_list_str = NULL;
+	StringInfoData table_list_buf;
 
 	elog(DEBUG1, "jdbc_fdw : %s", __func__);
 
@@ -3160,9 +3163,45 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 	server = GetForeignServer(serverOid);
 	user = GetUserMapping(GetUserId(), server->serverid);
+
+	/* Get JDBC connection for this server/user mapping */
 	jdbcUtilsInfo = jdbc_get_jdbc_utils_obj(server, user, false);
 
-	schema_list = jq_get_schema_info(jdbcUtilsInfo);
+	/* Extract remote schema name */
+	remote_schema = stmt->remote_schema;
+
+	/* Build comma-separated table list if LIMIT TO clause is present */
+	if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO && stmt->table_list != NIL)
+	{
+		bool		first_table = true;
+
+		initStringInfo(&table_list_buf);
+		foreach(lc, stmt->table_list)
+		{
+			RangeVar   *rv = (RangeVar *) lfirst(lc);
+
+			if (!first_table)
+				appendStringInfoString(&table_list_buf, ",");
+			appendStringInfoString(&table_list_buf, rv->relname);
+			first_table = false;
+		}
+		table_list_str = table_list_buf.data;
+
+		elog(DEBUG1, "jdbc_fdw: IMPORT FOREIGN SCHEMA filtering to tables: %s", table_list_str);
+	}
+
+	elog(DEBUG1, "jdbc_fdw: IMPORT FOREIGN SCHEMA from remote schema: %s",
+		 remote_schema ? remote_schema : "(all schemas)");
+
+	if (jdbcUtilsInfo == NULL)
+	{
+		ereport(ERROR, (errmsg("jdbcImportForeignSchema: jdbcUtilsInfo is NULL before calling jq_get_schema_info")));
+	}
+
+	schema_list = jq_get_schema_info(jdbcUtilsInfo, remote_schema, table_list_str);
+
+	elog(DEBUG1, "jdbc_fdw: Retrieved %d tables from remote schema", list_length(schema_list));
+
 	if (schema_list != NIL)
 	{
 		initStringInfo(&buf);
@@ -3170,6 +3209,10 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		foreach(table_lc, schema_list)
 		{
 			JtableInfo *tmpTableInfo = (JtableInfo *) lfirst(table_lc);
+
+			elog(DEBUG1, "jdbc_fdw: Processing table '%s' with %d columns",
+				 tmpTableInfo->table_name,
+				 list_length(tmpTableInfo->column_info));
 
 			/* Emit type conversion warnings if any */
 			char	  **warnings = jq_get_type_warnings(jdbcUtilsInfo, tmpTableInfo->table_name);
@@ -3189,14 +3232,20 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			resetStringInfo(&buf);
 			if (recreate)
 			{
-				appendStringInfo(&buf, "DROP FOREIGN TABLE IF EXISTS %s", tmpTableInfo->table_name);
+				appendStringInfo(&buf, "DROP FOREIGN TABLE IF EXISTS %s.%s",
+								 quote_identifier(stmt->local_schema),
+								 tmpTableInfo->table_name);
 				commands_drop = lappend(commands_drop, pstrdup(buf.data));
 				resetStringInfo(&buf);
-				appendStringInfo(&buf, "CREATE FOREIGN TABLE %s(", tmpTableInfo->table_name);
+				appendStringInfo(&buf, "CREATE FOREIGN TABLE %s.%s(",
+								 quote_identifier(stmt->local_schema),
+								 tmpTableInfo->table_name);
 			}
 			else
 			{
-				appendStringInfo(&buf, "CREATE FOREIGN TABLE IF NOT EXISTS %s(", tmpTableInfo->table_name);
+				appendStringInfo(&buf, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s(",
+								 quote_identifier(stmt->local_schema),
+								 tmpTableInfo->table_name);
 			}
 			first_column = true;
 			foreach(column_lc, tmpTableInfo->column_info)
@@ -3226,6 +3275,7 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					appendStringInfoString(&buf, " OPTIONS (key 'true')");
 			}
 			appendStringInfo(&buf, ") SERVER %s;", quote_identifier(server->servername));
+			elog(DEBUG1, "jdbc_fdw: Generated CREATE FOREIGN TABLE: %s", buf.data);
 			commands = lappend(commands, pstrdup(buf.data));
 	NEXT_COLUMN:
 			resetStringInfo(&buf);
@@ -3239,6 +3289,13 @@ jdbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 	/* Uninstall error context callback. */
 	jdbc_remove_error_callback(errcallback);
+
+	/* Execute the commands using SPI */
+	if (commands != NIL)
+	{
+		elog(DEBUG1, "jdbc_fdw: Executing %d CREATE FOREIGN TABLE commands", list_length(commands));
+		jdbc_execute_commands(commands);
+	}
 
 	return commands;
 }

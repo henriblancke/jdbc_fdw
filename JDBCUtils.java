@@ -397,15 +397,78 @@ public class JDBCUtils {
    *      Returns the column name
    */
   public String[] getTableNames() throws SQLException {
+    return getTableNames(null, null);
+  }
+
+  /*
+   * getTableNames
+   *      Returns the table names filtered by schema and table patterns
+   *      Parameters:
+   *        schemaPattern - schema name pattern (null means all schemas)
+   *        tableNames - comma-separated list of table names to filter (null means all tables)
+   */
+  public String[] getTableNames(String schemaPattern, String tableNames) throws SQLException {
     try {
       checkConnExist();
       DatabaseMetaData md = conn.getConnection().getMetaData();
-      ResultSet tmpResultSet = md.getTables(null, null, "%", null);
+
+      System.err.println("DEBUG getTableNames: schemaPattern=" + schemaPattern + ", tableNames=" + tableNames);
+
+      // If no specific tables requested, use wildcard pattern
+      String tablePattern = (tableNames == null || tableNames.isEmpty()) ? "%" : null;
+
+      // Parse comma-separated table names if provided (case-insensitive)
+      Set<String> requestedTables = new HashSet<String>();
+      if (tableNames != null && !tableNames.isEmpty()) {
+        String[] tables = tableNames.split(",");
+        for (String table : tables) {
+          requestedTables.add(table.trim().toUpperCase());
+        }
+      }
+      System.err.println("DEBUG requestedTables (uppercased): " + requestedTables);
+
+      // Use NULL schema pattern and filter on Java side for case-insensitive schema matching
+      // This works across all databases (Snowflake uppercase, BigQuery case-sensitive, etc.)
+      ResultSet tmpResultSet;
+      if (tablePattern != null) {
+        // No specific tables - use pattern matching
+        tmpResultSet = md.getTables(null, null, tablePattern, null);
+      } else {
+        // Specific tables requested - fetch all tables from all schemas and filter
+        tmpResultSet = md.getTables(null, null, "%", null);
+      }
 
       List<String> tmpTableNamesList = new ArrayList<String>();
+      int rowCount = 0;
       while (tmpResultSet.next()) {
-        tmpTableNamesList.add(tmpResultSet.getString(3));
+        String tableName = tmpResultSet.getString(3);
+        String schemaName = tmpResultSet.getString(2);
+        rowCount++;
+        System.err.println("DEBUG Row " + rowCount + ": schema=" + schemaName + ", table=" + tableName);
+
+        // Filter by schema name (case-insensitive)
+        boolean schemaMatches = false;
+        if (schemaPattern == null) {
+          schemaMatches = true;  // No schema filter
+        } else if (schemaName != null && schemaName.equalsIgnoreCase(schemaPattern)) {
+          schemaMatches = true;
+        }
+
+        if (!schemaMatches) {
+          System.err.println("DEBUG   -> schema doesn't match '" + schemaPattern + "', skipping");
+          continue;
+        }
+
+        // If specific tables were requested, filter to only those (case-insensitive)
+        if (requestedTables.isEmpty() || requestedTables.contains(tableName.toUpperCase())) {
+          tmpTableNamesList.add(tableName);
+          System.err.println("DEBUG   -> MATCHED schema and table, adding to result");
+        } else {
+          System.err.println("DEBUG   -> table name doesn't match, skipping");
+        }
       }
+      System.err.println("DEBUG Total rows from getTables: " + rowCount + ", matched: " + tmpTableNamesList.size());
+
       String[] tmpTableNames = new String[tmpTableNamesList.size()];
       for (int i = 0; i < tmpTableNamesList.size(); i++) {
         tmpTableNames[i] = tmpTableNamesList.get(i);
@@ -746,10 +809,13 @@ public class JDBCUtils {
         case "DATETIME":
         case "TIMESTAMP":
         case "TIMESTAMP_NTZ":
+        case "TIMESTAMPNTZ":
           pgType = "TIMESTAMP";
           break;
         case "TIMESTAMP_LTZ":
+        case "TIMESTAMPLTZ":
         case "TIMESTAMP_TZ":
+        case "TIMESTAMPTZ":
           pgType = "TIMESTAMPTZ";
           break;
         case "VARIANT":
@@ -849,6 +915,26 @@ public class JDBCUtils {
   public void cancel() throws SQLException {
     try {
       closeStatement();
+    } catch (Throwable e) {
+      throw e;
+    }
+  }
+
+  /*
+   * cleanup
+   *      Closes the JDBC connection and releases resources.
+   *      Called when the JDBCUtils instance is being destroyed.
+   */
+  public void cleanup() throws SQLException {
+    try {
+      closeStatement();
+      if (conn != null) {
+        Connection underlyingConn = conn.getConnection();
+        if (underlyingConn != null) {
+          underlyingConn.close();
+        }
+        conn = null;
+      }
     } catch (Throwable e) {
       throw e;
     }

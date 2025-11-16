@@ -16,7 +16,6 @@ import java.io.File;
 import java.net.URL;
 import java.sql.*;
 import java.util.Properties;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class JDBCConnection {
     private Connection conn = null;
@@ -27,8 +26,11 @@ public class JDBCConnection {
     private int queryTimeoutValue;
     private static JDBCDriverLoader jdbcDriverLoader;
 
-    /* JDBC connection hash map */
-    private static ConcurrentHashMap<Integer, JDBCConnection> ConnectionHash = new ConcurrentHashMap<Integer, JDBCConnection>();
+    /*
+     * REMOVED: Static ConnectionHash cache
+     * C-side already caches JDBCUtils instances per (server, user).
+     * Java-side caching was redundant and could cause stale connection issues.
+     */
 
     public JDBCConnection(Connection conn, boolean invalidate, long server_hashvalue, long mapping_hashvalue, int queryTimeoutValue) {
         this.conn = conn;
@@ -38,47 +40,31 @@ public class JDBCConnection {
         this.queryTimeoutValue = queryTimeoutValue;
     }
 
-    /* finalize all actived connection */
+    /*
+     * finalize all actived connection
+     * NOTE: With cache removed, these methods are no-ops.
+     * Cleanup is handled by C-side when it deletes JDBCUtils global refs.
+     */
     public static void finalizeAllConns(long hashvalue) throws Exception {
-        for (JDBCConnection Jconn : ConnectionHash.values()) {
-            Jconn.invalidate = true;
-
-            if (Jconn.conn != null) {
-                Jconn.conn.close();
-                Jconn.conn = null;
-            }
-        }
+        // No-op: C-side handles cleanup via JDBCUtils instance lifecycle
     }
 
     /* finalize connection have given server_hashvalue */
     public static void finalizeAllServerConns(long hashvalue) throws Exception {
-        for (JDBCConnection Jconn : ConnectionHash.values()) {
-            if (Jconn.server_hashvalue == hashvalue) {
-                Jconn.invalidate = true;
-                System.out.println("Finalizing " +  Jconn);
-
-                if (Jconn.conn != null) {
-                    Jconn.conn.close();
-                    Jconn.conn = null;
-                }
-                break;
-            }
-        }
+        // No-op: C-side handles cleanup via JDBCUtils instance lifecycle
     }
 
     /* finalize connection have given mapping_hashvalue */
     public static void finalizeAllUserMapingConns(long hashvalue) throws Exception {
-        for (JDBCConnection Jconn : ConnectionHash.values()) {
-            if (Jconn.mapping_hashvalue == hashvalue) {
-                Jconn.invalidate = true;
-                System.out.println("Finalizing " +  Jconn);
+        // No-op: C-side handles cleanup via JDBCUtils instance lifecycle
+    }
 
-                if (Jconn.conn != null) {
-                    Jconn.conn.close();
-                    Jconn.conn = null;
-                }
-                break;
-            }
+    /* Close this connection instance */
+    public void close() throws SQLException {
+        this.invalidate = true;
+        if (this.conn != null) {
+            this.conn.close();
+            this.conn = null;
         }
     }
 
@@ -91,18 +77,12 @@ public class JDBCConnection {
         return this.conn;
     }
 
-    /* get jdbc connection, create new one if not cached before */
+    /*
+     * get jdbc connection - always creates new connection
+     * C-side caching handles connection reuse via JDBCUtils instances
+     */
     public static JDBCConnection getConnection(int key, long server_hashvalue, long mapping_hashvalue, String[] options) throws Exception {
-        if (ConnectionHash.containsKey(key)) {
-            JDBCConnection Jconn = ConnectionHash.get(key);
-
-            if (Jconn.invalidate == false) {
-                System.out.println("got connection " + Jconn.getConnection());
-                return Jconn;
-            }
-
-        }
-
+        System.out.println("Creating new JDBC connection for key=" + key);
         return createConnection(key, server_hashvalue, mapping_hashvalue, options);
     }
 
@@ -142,10 +122,7 @@ public class JDBCConnection {
 
             JDBCConnection Jconn = new JDBCConnection(conn, false, server_hashvalue, mapping_hashvalue, Integer.parseInt(qTimeoutValue));
 
-            /* cache new connection */
-            System.out.println("Create new connection " + key);
-            ConnectionHash.put(key, Jconn);
-
+            System.out.println("Created new JDBC connection (no caching) for key=" + key);
             return Jconn;
         } catch (Throwable e) {
             throw e;

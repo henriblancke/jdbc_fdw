@@ -23,6 +23,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pthread.h"
+#include "storage/ipc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/elog.h"
@@ -52,19 +53,34 @@ typedef struct JdbcUtilCacheEntry
 } JdbcUtilCacheEntry;
 
 /*
- * JdbcUtils cache: save JdbcUtils object created based on Jenv (a thread local variable)
- * to re-use/release JDBCUtils object (not jdbc connection).
+ * JdbcUtils cache: save JdbcUtils object created for each connection.
+ * PostgreSQL backends are single-threaded, no need for thread-local storage.
+ *
+ * CRITICAL ISSUE DISCOVERED: Accessing hash entry fields directly in elog/ereport
+ * macros (e.g., entry->jdbcUtilsInfo) causes memory corruption. The PostgreSQL
+ * logging macros appear to evaluate their arguments multiple times or in a way
+ * that corrupts hash table entries. Always copy hash entry fields to local
+ * variables before passing them to elog/ereport.
+ *
+ * WRONG:  elog(LOG, "value=%p", (void *)entry->jdbcUtilsInfo);
+ * RIGHT:  JDBCUtilsInfo *val = entry->jdbcUtilsInfo;
+ *         elog(LOG, "value=%p", (void *)val);
  */
-static __thread HTAB *JdbcUtilsHash = NULL;
+static HTAB *JdbcUtilsHash = NULL;
 
 /* tracks whether any work is needed in callback functions */
-static __thread volatile bool xact_got_connection = false;
+static volatile bool xact_got_connection = false;
+
+/* Session tracking for pgBouncer detection */
+static Oid last_cache_userid = InvalidOid;
+static Oid last_cache_dbid = InvalidOid;
 
 /* prototypes of private functions */
 static JDBCUtilsInfo * connect_jdbc_server(ForeignServer *server, UserMapping *user);
 static void jdbc_check_conn_params(const char **keywords, const char **values);
 static void jdbcfdw_xact_callback(XactEvent event, void *arg);
 static void jdbc_fdw_inval_callback(Datum arg, int cacheid, uint32 hashvalue);
+static void jdbc_fdw_exit_callback(int code, Datum arg);
 
 /*
  * Get a Jconn which can be used to execute queries on the remote JDBC server
@@ -109,11 +125,32 @@ jdbc_get_jdbc_utils_obj(ForeignServer *server, UserMapping *user,
 									 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	}
 
+	/* Check for pgBouncer backend reuse */
+	if (JdbcUtilsHash != NULL)
+	{
+		Oid current_userid = GetUserId();
+		Oid current_dbid = MyDatabaseId;
+
+		if (last_cache_userid != InvalidOid &&
+		    (last_cache_userid != current_userid || last_cache_dbid != current_dbid))
+		{
+			elog(DEBUG1, "jdbc_fdw: Backend reuse detected in connection cache");
+			/* Clear all cached connections */
+			jdbc_release_jdbc_utils_obj();
+			/* Reset the hash table */
+			hash_destroy(JdbcUtilsHash);
+			JdbcUtilsHash = NULL;
+		}
+
+		last_cache_userid = current_userid;
+		last_cache_dbid = current_dbid;
+	}
+
 	/* First time through, initialize connection cache hashtable */
 	if (!xact_callback_registered)
 	{
 		/*
-		 * Register some callback functions that manage connection cleanup.
+		 * Register callback functions that manage connection cleanup.
 		 * This should be done just once in each backend.
 		 */
 		RegisterXactCallback(jdbcfdw_xact_callback, NULL);
@@ -121,6 +158,13 @@ jdbc_get_jdbc_utils_obj(ForeignServer *server, UserMapping *user,
 									  jdbc_fdw_inval_callback, (Datum) 0);
 		CacheRegisterSyscacheCallback(USERMAPPINGOID,
 									  jdbc_fdw_inval_callback, (Datum) 0);
+
+		/*
+		 * Register exit callback to cleanup malloc'd connections on backend exit.
+		 * This ensures no memory leaks even if connections aren't explicitly closed.
+		 */
+		on_proc_exit(jdbc_fdw_exit_callback, (Datum) 0);
+
 		xact_callback_registered = true;
 	}
 	ereport(DEBUG3, (errmsg("Added server = %s to hashtable", server->servername)));
@@ -142,27 +186,51 @@ jdbc_get_jdbc_utils_obj(ForeignServer *server, UserMapping *user,
 		entry->jdbcUtilsInfo = NULL;
 	}
 
+	/* Get current connection from cache (may be NULL) */
+	JDBCUtilsInfo *current_conn = entry->jdbcUtilsInfo;
+	JDBCUtilsInfo *result = current_conn;
+
 	/*
-	 * If cache entry doesn't have a connection, we have to establish a new
-	 * connection.  (If connect_jdbc_server throws an error, the cache entry
-	 * will be left in a valid empty state.)
+	 * If cache entry doesn't have a connection, establish a new one.
+	 * (If connect_jdbc_server throws an error, the cache entry will be left empty.)
 	 */
-	if (entry->jdbcUtilsInfo == NULL)
+	if (current_conn == NULL)
 	{
+		ereport(DEBUG3, (errmsg("Creating new JDBC connection")));
+
 		entry->server_hashvalue =
 			GetSysCacheHashValue1(FOREIGNSERVEROID,
 								  ObjectIdGetDatum(server->serverid));
 		entry->mapping_hashvalue =
 			GetSysCacheHashValue1(USERMAPPINGOID,
 								  ObjectIdGetDatum(user->umid));
-		entry->jdbcUtilsInfo = connect_jdbc_server(server, user);
+
+		/* Get the new connection */
+		JDBCUtilsInfo *new_connection = connect_jdbc_server(server, user);
+
+		if (new_connection == NULL) {
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("failed to connect to JDBC server")));
+		}
+
+		/* Store new connection in cache */
+		entry->jdbcUtilsInfo = new_connection;
+		result = new_connection;
 	}
 	else
 	{
+		ereport(DEBUG3, (errmsg("Reusing existing JDBC connection")));
 		jdbc_jvm_init(server, user);
+		result = current_conn;
 	}
 
-	return entry->jdbcUtilsInfo;
+	/* Final sanity check */
+	if (result == NULL) {
+		elog(ERROR, "jdbc_fdw: Failed to get JDBC connection");
+	}
+
+	return result;
 }
 
 /*
@@ -203,6 +271,10 @@ jdbc_fdw_inval_callback(Datum arg, int cacheid, uint32 hashvalue)
 			(cacheid == USERMAPPINGOID &&
 			 entry->mapping_hashvalue == hashvalue))
 		{
+			/* Delete the global JNI reference before clearing the object */
+			jq_release_jdbc_utils_object(entry->jdbcUtilsInfo);
+
+			/* Free palloc'd memory in CacheMemoryContext */
 			pfree(entry->jdbcUtilsInfo);
 			entry->jdbcUtilsInfo = NULL;
 		}
@@ -210,6 +282,39 @@ jdbc_fdw_inval_callback(Datum arg, int cacheid, uint32 hashvalue)
 
 	/* release JDBC connection on JDBCUtils object also */
 	jq_inval_callback(cacheid, hashvalue);
+}
+
+/*
+ * Exit callback to cleanup all malloc'd JDBC connections.
+ * This is called when the backend process exits (normally or abnormally).
+ * Ensures no memory leaks by freeing all cached connections.
+ */
+static void
+jdbc_fdw_exit_callback(int code, Datum arg)
+{
+	HASH_SEQ_STATUS scan;
+	JdbcUtilCacheEntry *entry;
+
+	/* If hash table was never created, nothing to cleanup */
+	if (JdbcUtilsHash == NULL)
+		return;
+
+	ereport(DEBUG1, (errmsg("jdbc_fdw: cleaning up connections on backend exit")));
+
+	/* Iterate through all cached connections and free them */
+	hash_seq_init(&scan, JdbcUtilsHash);
+	while ((entry = (JdbcUtilCacheEntry *) hash_seq_search(&scan)))
+	{
+		if (entry->jdbcUtilsInfo != NULL)
+		{
+			/* Clean up JNI global reference */
+			jq_release_jdbc_utils_object(entry->jdbcUtilsInfo);
+
+			/* Free palloc'd memory in CacheMemoryContext */
+			pfree(entry->jdbcUtilsInfo);
+			entry->jdbcUtilsInfo = NULL;
+		}
+	}
 }
 
 /*
@@ -289,7 +394,7 @@ connect_jdbc_server(ForeignServer *server, UserMapping *user)
 		/* Release Jconn data structure if we managed to create one */
 		if (jdbcUtilsInfo)
 		{
-			pfree(jdbcUtilsInfo);
+			pfree(jdbcUtilsInfo);  /* Free palloc'd memory in CacheMemoryContext */
 			jq_finish();
 		}
 		PG_RE_THROW();
@@ -334,30 +439,21 @@ jdbc_check_conn_params(const char **keywords, const char **values)
 void
 jdbc_release_jdbc_utils_obj(void)
 {
-	HASH_SEQ_STATUS scan;
-	JdbcUtilCacheEntry *entry;
-
-	/* there is no JDBCUtils object, do nothing */
-	if (JdbcUtilsHash == NULL)
-		return;
-
 	/*
-	 * Scan all connection cache entries and release its resource
+	 * CRITICAL: DO NOT release connections here!
+	 *
+	 * This function is called from error context callback during error formatting.
+	 * PostgreSQL calls error callbacks even for non-ERROR severities (INFO, DEBUG).
+	 * If we release connections here, we'll close active connections that are being used!
+	 *
+	 * Connection cleanup should happen at:
+	 * 1. Transaction end (jdbcfdw_xact_callback)
+	 * 2. Backend exit (jdbc_fdw_exit_callback)
+	 * 3. Cache invalidation (jdbc_fdw_inval_callback)
+	 *
+	 * NOT during error message formatting!
 	 */
-	hash_seq_init(&scan, JdbcUtilsHash);
-	while ((entry = (JdbcUtilCacheEntry *) hash_seq_search(&scan)))
-	{
-		/* Ignore cache entry if no open connection right now */
-		if (entry->jdbcUtilsInfo == NULL)
-			continue;
-
-		/* release JDBCUtils resource */
-		jq_cancel(entry->jdbcUtilsInfo);
-		entry->jdbcUtilsInfo->JDBCUtilsObject = NULL;
-		pfree(entry->jdbcUtilsInfo);
-		entry->jdbcUtilsInfo = NULL;
-	}
-	jq_finish();
+	return;  /* Do nothing - cleanup happens via other callbacks */
 }
 
 /*
@@ -438,10 +534,16 @@ jdbcfdw_xact_callback(XactEvent event, void *arg)
 	if (!xact_got_connection)
 		return;
 
-	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT)
+	/*
+	 * On transaction abort, close all connections since we can't be sure
+	 * what state they're in. On commit, keep connections alive for reuse
+	 * (following postgres_fdw keep_connections pattern).
+	 */
+	if (event == XACT_EVENT_ABORT)
 	{
 		/*
-		 * Scan all connection cache entries and release its resource
+		 * Transaction aborted - close all connections since they may be
+		 * in an inconsistent state.
 		 */
 		hash_seq_init(&scan, JdbcUtilsHash);
 		while ((entry = (JdbcUtilCacheEntry *) hash_seq_search(&scan)))
@@ -450,15 +552,35 @@ jdbcfdw_xact_callback(XactEvent event, void *arg)
 			if (entry->jdbcUtilsInfo == NULL)
 				continue;
 
-			/* release JDBCUtils resource */
+			/* release JDBCUtils resource and close connection */
 			jq_cancel(entry->jdbcUtilsInfo);
-			entry->jdbcUtilsInfo->JDBCUtilsObject = NULL;
-			pfree(entry->jdbcUtilsInfo);
+
+			/* Delete the global JNI reference before clearing the object */
+			jq_release_jdbc_utils_object(entry->jdbcUtilsInfo);
+
+			pfree(entry->jdbcUtilsInfo);  /* Free palloc'd memory in CacheMemoryContext */
 			entry->jdbcUtilsInfo = NULL;
 		}
 
 		jq_release_all_result_sets();
 		jq_finish();
+		xact_got_connection = false;
+	}
+	else if (event == XACT_EVENT_COMMIT)
+	{
+		/*
+		 * Transaction committed successfully - keep connections alive
+		 * for reuse in future transactions. Only release transaction-specific
+		 * resources like result sets.
+		 */
+		jq_release_all_result_sets();
+
+		/*
+		 * Note: We intentionally do NOT clear jdbcUtilsInfo or JDBCUtilsObject
+		 * here, allowing the connection to be reused in the next transaction.
+		 * The Java-side connection cache (JDBCConnection.ConnectionHash) will
+		 * also keep the underlying JDBC connection alive.
+		 */
 		xact_got_connection = false;
 	}
 }
