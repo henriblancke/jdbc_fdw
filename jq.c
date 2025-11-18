@@ -1767,6 +1767,10 @@ jq_get_exception()
 		/* determines if an exception is being thrown */
 		exc = (*Jenv)->ExceptionOccurred(Jenv);
 
+		/* Print exception details to stderr for debugging */
+		elog(LOG, "Java exception occurred, printing stack trace:");
+		(*Jenv)->ExceptionDescribe(Jenv);
+
 		/* get to the message and stack trace one as String */
 		objectClass = (*Jenv)->FindClass(Jenv, "java/lang/Object");
 		if (objectClass == NULL)

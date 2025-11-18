@@ -35,6 +35,11 @@ public class JDBCUtils {
       new ConcurrentHashMap<Integer, resultSetInfo>();
   private Map<String, List<String>> typeConversionWarnings = new HashMap<String, List<String>>();
 
+  /* Constructor */
+  public JDBCUtils() {
+    // Constructor initialization
+  }
+
   /*
    * createConnection
    *      Initiates the connection to the foreign database after setting
@@ -46,7 +51,12 @@ public class JDBCUtils {
    *
    */
   public void createConnection(int key, long server_hashvalue, long mapping_hashvalue, String[] options) throws Exception {
-    this.conn = JDBCConnection.getConnection(key, server_hashvalue, mapping_hashvalue, options);
+    try {
+      this.conn = JDBCConnection.getConnection(key, server_hashvalue, mapping_hashvalue, options);
+    } catch (Throwable e) {
+      // Connection failed - error will be propagated to PostgreSQL
+      throw e;
+    }
   }
 
   /*
@@ -67,6 +77,7 @@ public class JDBCUtils {
       }
       tmpStmt.executeQuery(query);
     } catch (Throwable e) {
+      // Query execution failed - error will be propagated to PostgreSQL
       throw e;
     }
   }
@@ -100,6 +111,7 @@ public class JDBCUtils {
               tmpResultSet, tmpNumberOfColumns, tmpNumberOfAffectedRows, null));
       return tmpResultSetKey;
     } catch (Throwable e) {
+      // Query execution failed - error will be propagated to PostgreSQL
       throw e;
     }
   }
@@ -411,35 +423,64 @@ public class JDBCUtils {
     try {
       checkConnExist();
       DatabaseMetaData md = conn.getConnection().getMetaData();
-
-      System.err.println("DEBUG getTableNames: schemaPattern=" + schemaPattern + ", tableNames=" + tableNames);
+      String databaseProduct = getDatabaseProduct();
 
       // If no specific tables requested, use wildcard pattern
       String tablePattern = (tableNames == null || tableNames.isEmpty()) ? "%" : null;
 
-      // Parse comma-separated table names if provided (case-insensitive)
-      Set<String> requestedTables = new HashSet<String>();
+      // Parse comma-separated table names if provided
+      // Note: We store them in original case for most databases
+      // Snowflake requires uppercasing for case-insensitive matching
+      Set<String> requestedTablesOriginal = new HashSet<String>();
+      Set<String> requestedTablesUpper = new HashSet<String>();
       if (tableNames != null && !tableNames.isEmpty()) {
         String[] tables = tableNames.split(",");
         for (String table : tables) {
-          requestedTables.add(table.trim().toUpperCase());
+          String trimmed = table.trim();
+          requestedTablesOriginal.add(trimmed);
+          requestedTablesUpper.add(trimmed.toUpperCase());
         }
       }
-      System.err.println("DEBUG requestedTables (uppercased): " + requestedTables);
+      // Debug logging (commented out to reduce log spam)
+      // System.err.println("DEBUG requestedTables (original): " + requestedTablesOriginal);
+      // System.err.println("DEBUG requestedTables (uppercased): " + requestedTablesUpper);
+
+      /*
+       * MSSQL uses catalog.schema.table naming where:
+       * - catalog = database name (e.g., "master")
+       * - schema = schema name (e.g., "dbo")
+       * For MSSQL, we need to interpret schemaPattern as catalog name if it doesn't contain a dot
+       */
+      String catalogPattern = null;
+      String actualSchemaPattern = schemaPattern;
+      boolean isMSSQL = databaseProduct.contains("sql server") ||
+                        databaseProduct.contains("sqlserver") ||
+                        databaseProduct.contains("microsoft");
+
+      if (isMSSQL && schemaPattern != null) {
+        // For MSSQL, treat schemaPattern as catalog (database) name
+        // and use null/% for schema to get all schemas in that database
+        catalogPattern = schemaPattern;
+        actualSchemaPattern = null;  // Get all schemas within the catalog
+        // Debug logging for MSSQL detection
+        // System.err.println("DEBUG MSSQL detected: using catalog=" + catalogPattern + ", schema=" + actualSchemaPattern);
+      }
 
       /*
        * Optimization: If schema is specified, pass it to getTables to reduce result set.
        * Otherwise fetch all schemas and filter on Java side for case-insensitive matching.
        */
       ResultSet tmpResultSet;
+
+      // ClickHouse and some databases require explicit table types
+      String[] tableTypes = new String[] { "TABLE", "VIEW" };
+
       if (tablePattern != null) {
         // No specific tables - use pattern matching
-        // If schema specified, use it; otherwise fetch from all schemas
-        tmpResultSet = md.getTables(null, schemaPattern, tablePattern, null);
+        tmpResultSet = md.getTables(catalogPattern, actualSchemaPattern, tablePattern, tableTypes);
       } else {
-        // Specific tables requested - fetch from specified schema or all schemas
-        // Use schemaPattern to limit scope (reduces rows for Snowflake performance)
-        tmpResultSet = md.getTables(null, schemaPattern, "%", null);
+        // Specific tables requested - fetch all tables from catalog/schema
+        tmpResultSet = md.getTables(catalogPattern, actualSchemaPattern, "%", tableTypes);
       }
 
       List<String> tmpTableNamesList = new ArrayList<String>();
@@ -447,31 +488,48 @@ public class JDBCUtils {
       while (tmpResultSet.next()) {
         String tableName = tmpResultSet.getString(3);
         String schemaName = tmpResultSet.getString(2);
+        String catalogName = tmpResultSet.getString(1);
         rowCount++;
-        System.err.println("DEBUG Row " + rowCount + ": schema=" + schemaName + ", table=" + tableName);
+        // Reduce log spam - only log matched tables
+        // System.err.println("DEBUG Row " + rowCount + ": catalog=" + catalogName + ", schema=" + schemaName + ", table=" + tableName);
 
-        // Filter by schema name (case-insensitive)
+        // For MSSQL, we already filtered by catalog in getTables(), so skip schema matching
+        // For other databases, filter by schema name (case-insensitive)
         boolean schemaMatches = false;
-        if (schemaPattern == null) {
+        if (isMSSQL) {
+          schemaMatches = true;  // Already filtered by catalog
+        } else if (actualSchemaPattern == null) {
           schemaMatches = true;  // No schema filter
-        } else if (schemaName != null && schemaName.equalsIgnoreCase(schemaPattern)) {
+        } else if (schemaName != null && schemaName.equalsIgnoreCase(actualSchemaPattern)) {
           schemaMatches = true;
         }
 
         if (!schemaMatches) {
-          System.err.println("DEBUG   -> schema doesn't match '" + schemaPattern + "', skipping");
+          // System.err.println("DEBUG   -> schema doesn't match '" + actualSchemaPattern + "', skipping");
           continue;
         }
 
-        // If specific tables were requested, filter to only those (case-insensitive)
-        if (requestedTables.isEmpty() || requestedTables.contains(tableName.toUpperCase())) {
-          tmpTableNamesList.add(tableName);
-          System.err.println("DEBUG   -> MATCHED schema and table, adding to result");
+        // If specific tables were requested, filter to only those
+        // For Snowflake: uppercase matching (case-insensitive via uppercase)
+        // For others: try exact case match first, then case-insensitive as fallback
+        boolean tableMatches = false;
+        boolean isSnowflake = databaseProduct.contains("snowflake");
+
+        if (requestedTablesOriginal.isEmpty() && requestedTablesUpper.isEmpty()) {
+          tableMatches = true;  // No table filter
+        } else if (isSnowflake) {
+          // Snowflake: case-insensitive via uppercase
+          tableMatches = requestedTablesUpper.contains(tableName.toUpperCase());
         } else {
-          System.err.println("DEBUG   -> table name doesn't match, skipping");
+          // Others: try exact match first (for case-sensitive DBs), then case-insensitive
+          tableMatches = requestedTablesOriginal.contains(tableName) ||
+                        requestedTablesUpper.contains(tableName.toUpperCase());
+        }
+
+        if (tableMatches) {
+          tmpTableNamesList.add(tableName);
         }
       }
-      System.err.println("DEBUG Total rows from getTables: " + rowCount + ", matched: " + tmpTableNamesList.size());
 
       String[] tmpTableNames = new String[tmpTableNamesList.size()];
       for (int i = 0; i < tmpTableNamesList.size(); i++) {
@@ -479,6 +537,9 @@ public class JDBCUtils {
       }
       return tmpTableNames;
     } catch (Throwable e) {
+      // Log the full exception for debugging
+      System.err.println("ERROR in getTableNames: " + e.getClass().getName() + ": " + e.getMessage());
+      e.printStackTrace(System.err);
       throw e;
     }
   }
@@ -511,9 +572,17 @@ public class JDBCUtils {
    *      Returns the database product name in lowercase
    */
   private String getDatabaseProduct() throws SQLException {
-    checkConnExist();
-    String product = conn.getConnection().getMetaData().getDatabaseProductName();
-    return product.toLowerCase();
+    try {
+      checkConnExist();
+      Connection c = conn.getConnection();
+      DatabaseMetaData md = c.getMetaData();
+      String product = md.getDatabaseProductName();
+      return product.toLowerCase();
+    } catch (Throwable e) {
+      System.err.println("=== getDatabaseProduct FAILED: " + e.getClass().getName() + ": " + e.getMessage());
+      e.printStackTrace(System.err);
+      throw e;
+    }
   }
 
   /*
@@ -529,11 +598,20 @@ public class JDBCUtils {
         return getBigQueryColumnTypes(tableName);
       } else if (databaseProduct.contains("snowflake")) {
         return getSnowflakeColumnTypes(tableName);
+      } else if (databaseProduct.contains("clickhouse")) {
+        return getClickHouseColumnTypes(tableName);
+      } else if (databaseProduct.contains("sql server") ||
+                 databaseProduct.contains("sqlserver") ||
+                 databaseProduct.contains("microsoft")) {
+        return getMSSQLColumnTypes(tableName);
       } else {
         // Default/generic mapper (original implementation for GridDB, etc.)
         return getGenericColumnTypes(tableName);
       }
     } catch (Throwable e) {
+      // Log the full exception for debugging
+      System.err.println("ERROR in getColumnTypes: " + e.getClass().getName() + ": " + e.getMessage());
+      e.printStackTrace(System.err);
       throw e;
     }
   }
@@ -863,6 +941,326 @@ public class JDBCUtils {
     // Store warnings for later retrieval
     if (!warnings.isEmpty()) {
       typeConversionWarnings.put(tableName, warnings);
+    }
+
+    return types.toArray(new String[0]);
+  }
+
+  /*
+   * getClickHouseColumnTypes
+   *      Returns PostgreSQL column types for ClickHouse database with intelligent fallbacks
+   */
+  private String[] getClickHouseColumnTypes(String tableName) throws SQLException {
+    checkConnExist();
+    DatabaseMetaData md = conn.getConnection().getMetaData();
+    ResultSet rs = md.getColumns(null, null, tableName, null);
+    List<String> types = new ArrayList<String>();
+    List<String> warnings = new ArrayList<String>();
+
+    while (rs.next()) {
+      String typeName = rs.getString("TYPE_NAME");
+      String columnName = rs.getString("COLUMN_NAME");
+      int precision = rs.getInt("COLUMN_SIZE");
+      int scale = rs.getInt("DECIMAL_DIGITS");
+      String pgType;
+
+      if (typeName == null) {
+        typeName = "";
+      }
+
+      // ClickHouse wraps nullable types as Nullable(T), strip wrapper if present
+      String baseType = typeName;
+      boolean isNullable = false;
+      if (typeName.toUpperCase().startsWith("NULLABLE(") && typeName.endsWith(")")) {
+        baseType = typeName.substring(9, typeName.length() - 1);
+        isNullable = true;
+      }
+
+      // Normalize to uppercase for comparison
+      String normalizedType = baseType.toUpperCase().trim();
+
+      // Handle ClickHouse data types
+      if (normalizedType.equals("INT8") || normalizedType.equals("TINYINT")) {
+        pgType = "SMALLINT";
+      } else if (normalizedType.equals("INT16") || normalizedType.equals("SMALLINT")) {
+        pgType = "SMALLINT";
+      } else if (normalizedType.equals("INT32") || normalizedType.equals("INT") || normalizedType.equals("INTEGER")) {
+        pgType = "INTEGER";
+      } else if (normalizedType.equals("INT64") || normalizedType.equals("BIGINT")) {
+        pgType = "BIGINT";
+      } else if (normalizedType.equals("UINT8")) {
+        pgType = "SMALLINT";
+        warnings.add("Column '" + columnName + "': UInt8 mapped to SMALLINT (may overflow if value > 127)");
+      } else if (normalizedType.equals("UINT16")) {
+        pgType = "INTEGER";
+        warnings.add("Column '" + columnName + "': UInt16 mapped to INTEGER (may overflow if value > 32767)");
+      } else if (normalizedType.equals("UINT32")) {
+        pgType = "BIGINT";
+        warnings.add("Column '" + columnName + "': UInt32 mapped to BIGINT (may overflow if value > 2147483647)");
+      } else if (normalizedType.equals("UINT64")) {
+        pgType = "NUMERIC(20,0)";
+        warnings.add("Column '" + columnName + "': UInt64 mapped to NUMERIC(20,0) (PostgreSQL BIGINT cannot represent full range)");
+      } else if (normalizedType.equals("FLOAT32") || normalizedType.equals("FLOAT")) {
+        pgType = "REAL";
+      } else if (normalizedType.equals("FLOAT64") || normalizedType.equals("DOUBLE")) {
+        pgType = "DOUBLE PRECISION";
+      } else if (normalizedType.startsWith("DECIMAL") || normalizedType.startsWith("NUMERIC")) {
+        if (precision > 0 && scale >= 0) {
+          pgType = String.format("NUMERIC(%d,%d)", precision, scale);
+        } else {
+          pgType = "NUMERIC";
+        }
+      } else if (normalizedType.equals("STRING") || normalizedType.equals("TEXT") ||
+                 normalizedType.equals("VARCHAR") || normalizedType.equals("CHAR")) {
+        pgType = "TEXT";
+      } else if (normalizedType.startsWith("FIXEDSTRING")) {
+        // FixedString(N) -> VARCHAR(N)
+        if (precision > 0) {
+          pgType = String.format("VARCHAR(%d)", precision);
+        } else {
+          pgType = "VARCHAR";
+        }
+      } else if (normalizedType.equals("UUID")) {
+        pgType = "UUID";
+      } else if (normalizedType.equals("DATE") || normalizedType.equals("DATE32")) {
+        pgType = "DATE";
+      } else if (normalizedType.equals("DATETIME") || normalizedType.startsWith("DATETIME64")) {
+        pgType = "TIMESTAMP";
+      } else if (normalizedType.equals("TIMESTAMP")) {
+        pgType = "TIMESTAMP";
+      } else if (normalizedType.startsWith("INTERVAL")) {
+        pgType = "INTERVAL";
+      } else if (normalizedType.equals("BOOLEAN") || normalizedType.equals("BOOL")) {
+        pgType = "BOOLEAN";
+      } else if (normalizedType.startsWith("ENUM8") || normalizedType.startsWith("ENUM16")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': " + typeName + " mapped to TEXT (consider creating PostgreSQL ENUM)");
+      } else if (normalizedType.startsWith("ARRAY(")) {
+        // Extract element type from Array(T)
+        String elementType = normalizedType.substring(6, normalizedType.length() - 1).trim();
+
+        // Map common element types to PostgreSQL array types
+        if (elementType.equals("INT8") || elementType.equals("INT16")) {
+          pgType = "SMALLINT[]";
+        } else if (elementType.equals("INT32") || elementType.equals("INT")) {
+          pgType = "INTEGER[]";
+        } else if (elementType.equals("INT64")) {
+          pgType = "BIGINT[]";
+        } else if (elementType.equals("FLOAT32")) {
+          pgType = "REAL[]";
+        } else if (elementType.equals("FLOAT64")) {
+          pgType = "DOUBLE PRECISION[]";
+        } else if (elementType.equals("STRING")) {
+          pgType = "TEXT[]";
+        } else if (elementType.equals("UUID")) {
+          pgType = "UUID[]";
+        } else if (elementType.equals("DATE")) {
+          pgType = "DATE[]";
+        } else if (elementType.equals("BOOLEAN")) {
+          pgType = "BOOLEAN[]";
+        } else {
+          pgType = "JSONB";
+          warnings.add("Column '" + columnName + "': Complex ARRAY type mapped to JSONB");
+        }
+      } else if (normalizedType.startsWith("TUPLE(")) {
+        pgType = "JSONB";
+        warnings.add("Column '" + columnName + "': TUPLE type mapped to JSONB (structure flattened)");
+      } else if (normalizedType.startsWith("MAP(")) {
+        pgType = "JSONB";
+        warnings.add("Column '" + columnName + "': MAP type mapped to JSONB");
+      } else if (normalizedType.equals("JSON") || normalizedType.startsWith("JSON(")) {
+        pgType = "JSONB";
+      } else if (normalizedType.startsWith("NESTED(")) {
+        pgType = "JSONB";
+        warnings.add("Column '" + columnName + "': NESTED type mapped to JSONB (nested structure flattened)");
+      } else if (normalizedType.equals("IPV4")) {
+        pgType = "INET";
+      } else if (normalizedType.equals("IPV6")) {
+        pgType = "INET";
+      } else if (normalizedType.startsWith("LOWCARDINALITY(")) {
+        // LowCardinality(T) - extract base type and map that
+        String innerType = normalizedType.substring(15, normalizedType.length() - 1).trim();
+        if (innerType.equals("STRING")) {
+          pgType = "TEXT";
+        } else {
+          pgType = "TEXT";
+          warnings.add("Column '" + columnName + "': LowCardinality(" + innerType + ") mapped to TEXT");
+        }
+      } else if (normalizedType.startsWith("AGGREGATEFUNCTION")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': AggregateFunction type mapped to TEXT (not queryable)");
+      } else if (normalizedType.startsWith("SIMPLEAGGREGATEFUNCTION")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': SimpleAggregateFunction type mapped to TEXT");
+      } else {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': Unknown ClickHouse type '" + typeName + "' mapped to TEXT");
+      }
+
+      types.add(pgType);
+    }
+
+    // Store warnings for later retrieval
+    if (!warnings.isEmpty()) {
+      typeConversionWarnings.put(tableName, warnings);
+    }
+
+    return types.toArray(new String[0]);
+  }
+
+  /*
+   * getMSSQLColumnTypes
+   *      Returns PostgreSQL column types for Microsoft SQL Server database with intelligent fallbacks
+   */
+  private String[] getMSSQLColumnTypes(String tableName) throws SQLException {
+    checkConnExist();
+    DatabaseMetaData md = conn.getConnection().getMetaData();
+
+    // For MSSQL, try to get columns with different catalog/schema combinations
+    // First try: null catalog, null schema (current database)
+    ResultSet rs = md.getColumns(null, null, tableName, null);
+
+    // Check if we got any results
+    boolean hasResults = false;
+    try {
+      hasResults = rs.next();
+      // Reset to before first row if we have results
+      if (hasResults) {
+        rs.close();
+        rs = md.getColumns(null, null, tableName, null);
+      }
+    } catch (SQLException e) {
+      System.err.println("WARN: Error checking if columns ResultSet has data: " + e.getMessage());
+    }
+
+    // If no results, try with % for schema to search all schemas
+    if (!hasResults) {
+      rs.close();
+      rs = md.getColumns(null, "%", tableName, null);
+    }
+
+    List<String> types = new ArrayList<String>();
+    List<String> warnings = new ArrayList<String>();
+
+    while (rs.next()) {
+      String typeName = rs.getString("TYPE_NAME");
+      String columnName = rs.getString("COLUMN_NAME");
+      int precision = rs.getInt("COLUMN_SIZE");
+      int scale = rs.getInt("DECIMAL_DIGITS");
+      String pgType;
+
+      if (typeName == null) {
+        typeName = "";
+      }
+
+      // Normalize to uppercase for comparison
+      String normalizedType = typeName.toUpperCase().trim();
+
+      // Handle MSSQL data types
+      if (normalizedType.equals("TINYINT")) {
+        // MSSQL tinyint is 0-255 (unsigned), PostgreSQL smallint is -32768 to 32767
+        pgType = "SMALLINT";
+      } else if (normalizedType.equals("SMALLINT")) {
+        pgType = "SMALLINT";
+      } else if (normalizedType.equals("INT")) {
+        pgType = "INTEGER";
+      } else if (normalizedType.equals("BIGINT")) {
+        pgType = "BIGINT";
+      } else if (normalizedType.equals("DECIMAL") || normalizedType.equals("NUMERIC")) {
+        if (precision > 0 && scale >= 0) {
+          pgType = String.format("NUMERIC(%d,%d)", precision, scale);
+        } else {
+          pgType = "NUMERIC";
+        }
+      } else if (normalizedType.equals("MONEY") || normalizedType.equals("SMALLMONEY")) {
+        pgType = "NUMERIC(19,4)";
+        warnings.add("Column '" + columnName + "': " + typeName + " mapped to NUMERIC(19,4)");
+      } else if (normalizedType.equals("FLOAT") || normalizedType.equals("DOUBLE PRECISION")) {
+        pgType = "DOUBLE PRECISION";
+      } else if (normalizedType.equals("REAL")) {
+        pgType = "REAL";
+      } else if (normalizedType.equals("BIT")) {
+        pgType = "BOOLEAN";
+      } else if (normalizedType.equals("CHAR") || normalizedType.equals("NCHAR")) {
+        if (precision > 0) {
+          pgType = String.format("CHAR(%d)", precision);
+        } else {
+          pgType = "CHAR";
+        }
+      } else if (normalizedType.equals("VARCHAR") || normalizedType.equals("NVARCHAR")) {
+        if (precision > 0 && precision < 2147483647) {
+          pgType = String.format("VARCHAR(%d)", precision);
+        } else {
+          // varchar(max) or nvarchar(max)
+          pgType = "TEXT";
+          if (precision == 2147483647) {
+            warnings.add("Column '" + columnName + "': " + typeName + "(MAX) mapped to TEXT");
+          }
+        }
+      } else if (normalizedType.equals("TEXT") || normalizedType.equals("NTEXT")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': " + typeName + " (deprecated in MSSQL) mapped to TEXT");
+      } else if (normalizedType.equals("BINARY") || normalizedType.equals("VARBINARY")) {
+        if (precision > 0 && precision < 2147483647) {
+          pgType = "BYTEA";
+        } else {
+          // varbinary(max)
+          pgType = "BYTEA";
+          if (precision == 2147483647) {
+            warnings.add("Column '" + columnName + "': VARBINARY(MAX) mapped to BYTEA");
+          }
+        }
+      } else if (normalizedType.equals("IMAGE")) {
+        pgType = "BYTEA";
+        warnings.add("Column '" + columnName + "': IMAGE (deprecated in MSSQL) mapped to BYTEA");
+      } else if (normalizedType.equals("DATE")) {
+        pgType = "DATE";
+      } else if (normalizedType.equals("TIME")) {
+        pgType = "TIME";
+      } else if (normalizedType.equals("DATETIME") || normalizedType.equals("SMALLDATETIME")) {
+        pgType = "TIMESTAMP";
+      } else if (normalizedType.equals("DATETIME2")) {
+        pgType = "TIMESTAMP";
+      } else if (normalizedType.equals("DATETIMEOFFSET")) {
+        pgType = "TIMESTAMPTZ";
+      } else if (normalizedType.equals("UNIQUEIDENTIFIER")) {
+        pgType = "UUID";
+      } else if (normalizedType.equals("XML")) {
+        pgType = "XML";
+      } else if (normalizedType.equals("JSON")) {
+        pgType = "JSONB";
+      } else if (normalizedType.equals("GEOGRAPHY")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': GEOGRAPHY mapped to TEXT (WKT format, consider PostGIS)");
+      } else if (normalizedType.equals("GEOMETRY")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': GEOMETRY mapped to TEXT (WKT format, consider PostGIS)");
+      } else if (normalizedType.equals("HIERARCHYID")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': HIERARCHYID mapped to TEXT (path representation)");
+      } else if (normalizedType.equals("SQL_VARIANT")) {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': SQL_VARIANT mapped to TEXT (type information lost)");
+      } else if (normalizedType.equals("TIMESTAMP") || normalizedType.equals("ROWVERSION")) {
+        // MSSQL timestamp/rowversion is a binary row version, not a date/time
+        pgType = "BYTEA";
+        warnings.add("Column '" + columnName + "': " + typeName + " (binary row version) mapped to BYTEA");
+      } else {
+        pgType = "TEXT";
+        warnings.add("Column '" + columnName + "': Unknown MSSQL type '" + typeName + "' mapped to TEXT");
+      }
+
+      types.add(pgType);
+    }
+
+    // Store warnings for later retrieval
+    if (!warnings.isEmpty()) {
+      typeConversionWarnings.put(tableName, warnings);
+    }
+
+    if (types.isEmpty()) {
+      System.err.println("ERROR: No columns found for MSSQL table: " + tableName);
+      throw new SQLException("No columns found for table: " + tableName);
     }
 
     return types.toArray(new String[0]);

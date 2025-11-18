@@ -279,19 +279,75 @@ jdbc_append_limit_clause(deparse_expr_cxt *context)
 	PlannerInfo *root = context->root;
 	StringInfo	buf = context->buf;
 	int			nestlevel;
+	char	   *q_char;
+	bool		use_standard_syntax = true;  /* Default to SQL:2008 standard */
 
 	/* Make sure any constants in the exprs are printed portably */
 	nestlevel = jdbc_set_transmission_modes();
 
-	if (root->parse->limitCount)
+	/* Get quote character - used to detect database type */
+	q_char = context->q_char;
+
+	/*
+	 * Detect database type by quote character:
+	 * - MySQL uses backtick (`) - needs LIMIT syntax
+	 * - Others use " or [ - can use standard SQL OFFSET/FETCH
+	 *
+	 * Use SQL:2008 standard OFFSET/FETCH for all except MySQL.
+	 * This works for: MSSQL (2012+), PostgreSQL (8.4+), Oracle (12c+), etc.
+	 */
+
+	if (q_char != NULL && strlen(q_char) > 0 && q_char[0] == '`')
 	{
-		appendStringInfoString(buf, " LIMIT ");
-		jdbc_deparse_expr((Expr *) root->parse->limitCount, context);
+		/* MySQL detected - use LIMIT syntax */
+		use_standard_syntax = false;
 	}
-	if (root->parse->limitOffset)
+
+	if (use_standard_syntax)
 	{
-		appendStringInfoString(buf, " OFFSET ");
-		jdbc_deparse_expr((Expr *) root->parse->limitOffset, context);
+		/*
+		 * SQL:2008 OFFSET/FETCH syntax.
+		 * Note: MSSQL requires ORDER BY when using OFFSET/FETCH.
+		 * If no ORDER BY exists, add a dummy one.
+		 */
+
+		/* Add dummy ORDER BY if not already present in the query */
+		/* TODO: Check if ORDER BY already exists to avoid duplication */
+		appendStringInfoString(buf, " ORDER BY (SELECT NULL)");
+
+		/* MSSQL requires OFFSET even if it's 0 */
+		if (root->parse->limitOffset)
+		{
+			appendStringInfoString(buf, " OFFSET ");
+			jdbc_deparse_expr((Expr *) root->parse->limitOffset, context);
+			appendStringInfoString(buf, " ROWS");
+		}
+		else if (root->parse->limitCount)
+		{
+			/* If LIMIT without OFFSET, use OFFSET 0 */
+			appendStringInfoString(buf, " OFFSET 0 ROWS");
+		}
+
+		if (root->parse->limitCount)
+		{
+			appendStringInfoString(buf, " FETCH NEXT ");
+			jdbc_deparse_expr((Expr *) root->parse->limitCount, context);
+			appendStringInfoString(buf, " ROWS ONLY");
+		}
+	}
+	else
+	{
+		/* MySQL LIMIT/OFFSET syntax */
+		if (root->parse->limitCount)
+		{
+			appendStringInfoString(buf, " LIMIT ");
+			jdbc_deparse_expr((Expr *) root->parse->limitCount, context);
+		}
+		if (root->parse->limitOffset)
+		{
+			appendStringInfoString(buf, " OFFSET ");
+			jdbc_deparse_expr((Expr *) root->parse->limitOffset, context);
+		}
 	}
 
 	jdbc_reset_transmission_modes(nestlevel);
@@ -1012,6 +1068,7 @@ jdbc_deparse_select_stmt_for_rel(StringInfo buf,
 	context.foreignrel = baserel;
 	context.params_list = params_list;
 	context.scanrel = IS_UPPER_REL(baserel) ? fpinfo->outerrel : baserel;
+	context.q_char = q_char;	/* Set quote character for database-specific syntax */
 
 
 	jdbc_deparse_select_sql(buf, root, baserel, remote_conds,

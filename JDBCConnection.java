@@ -82,7 +82,6 @@ public class JDBCConnection {
      * C-side caching handles connection reuse via JDBCUtils instances
      */
     public static JDBCConnection getConnection(int key, long server_hashvalue, long mapping_hashvalue, String[] options) throws Exception {
-        System.out.println("Creating new JDBC connection for key=" + key);
         return createConnection(key, server_hashvalue, mapping_hashvalue, options);
     }
 
@@ -121,8 +120,6 @@ public class JDBCConnection {
                 throw new SQLException("Cannot connect server: " + url);
 
             JDBCConnection Jconn = new JDBCConnection(conn, false, server_hashvalue, mapping_hashvalue, Integer.parseInt(qTimeoutValue));
-
-            System.out.println("Created new JDBC connection (no caching) for key=" + key);
             return Jconn;
         } catch (Throwable e) {
             throw e;
